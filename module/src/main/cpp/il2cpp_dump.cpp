@@ -13,6 +13,8 @@
 #include <fstream>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <signal.h>
+#include <setjmp.h>
 #include "xdl.h"
 #include "log.h"
 #include "il2cpp-tabledefs.h"
@@ -438,6 +440,70 @@ void il2cpp_dump(const char *outDir) {
     dump_metadata(outDir);
 }
 
+// Signal handler for safe memory reading
+static sigjmp_buf jump_buffer;
+static volatile sig_atomic_t can_read = 0;
+
+static void segv_handler(int sig) {
+    if (can_read) {
+        siglongjmp(jump_buffer, 1);
+    }
+}
+
+// Safely check if memory is readable
+static bool is_memory_readable(void *addr, size_t size) {
+    // Use mincore to check if pages are mapped
+    size_t page_size = sysconf(_SC_PAGESIZE);
+    void *page_addr = (void *)((uintptr_t)addr & ~(page_size - 1));
+    size_t pages = (size + page_size - 1) / page_size;
+    
+    unsigned char *vec = (unsigned char *)malloc(pages);
+    if (!vec) return false;
+    
+    int result = mincore(page_addr, pages * page_size, vec);
+    free(vec);
+    
+    // mincore returns 0 on success (pages are mapped)
+    return (result == 0);
+}
+
+// Safely read uint32 from memory
+static bool safe_read_uint32(void *addr, uint32_t *out) {
+    // First check if the page is mapped
+    if (!is_memory_readable(addr, 4)) {
+        return false;
+    }
+    
+    // Set up signal handler
+    struct sigaction sa, old_sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = segv_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    
+    if (sigaction(SIGSEGV, &sa, &old_sa) < 0) {
+        return false;
+    }
+    if (sigaction(SIGBUS, &sa, &old_sa) < 0) {
+        sigaction(SIGSEGV, &old_sa, nullptr);
+        return false;
+    }
+    
+    bool success = false;
+    can_read = 1;
+    
+    if (sigsetjmp(jump_buffer, 1) == 0) {
+        *out = *(volatile uint32_t *)addr;
+        success = true;
+    }
+    
+    can_read = 0;
+    sigaction(SIGSEGV, &old_sa, nullptr);
+    sigaction(SIGBUS, &old_sa, nullptr);
+    
+    return success;
+}
+
 // Search for metadata in memory and dump it
 static void dump_metadata(const char *outDir) {
     LOGI("Searching for decrypted metadata in memory...");
@@ -455,7 +521,9 @@ static void dump_metadata(const char *outDir) {
         // Parse memory region
         unsigned long start, end;
         char perms[5];
-        if (sscanf(line, "%lx-%lx %4s", &start, &end, perms) != 3) {
+        char path[256] = {0};
+        
+        if (sscanf(line, "%lx-%lx %4s %*s %*s %*s %255s", &start, &end, perms, path) < 3) {
             continue;
         }
         
@@ -464,72 +532,110 @@ static void dump_metadata(const char *outDir) {
             continue;
         }
         
-        // Skip small regions (metadata is usually > 1MB)
-        size_t size = end - start;
-        if (size < 0x100000) {
+        // Skip certain regions that are unlikely to contain metadata
+        if (strstr(path, "[vdso]") || strstr(path, "[vvar]") || 
+            strstr(path, "/dev/") || strstr(path, "/system/")) {
             continue;
         }
         
+        // Skip small regions (metadata is usually > 10MB)
+        size_t size = end - start;
+        if (size < 0x100000 || size > 0x20000000) { // 1MB - 512MB
+            continue;
+        }
+        
+        LOGI("Scanning region %lx-%lx (%zu MB) %s", start, end, size / (1024*1024), path);
+        
         // Search for metadata magic in this region
         uint8_t *ptr = (uint8_t *)start;
-        uint8_t *region_end = (uint8_t *)end - 4;
+        uint8_t *region_end = (uint8_t *)end - 8; // Need at least 8 bytes for magic + version
         
         while (ptr < region_end) {
-            // Check for magic number
-            if (*(uint32_t *)ptr == METADATA_MAGIC) {
-                // Verify it's metadata by checking version
-                uint32_t version = *(uint32_t *)(ptr + 4);
+            uint32_t magic = 0;
+            
+            // Safely read magic number
+            if (!safe_read_uint32(ptr, &magic)) {
+                // Skip this page if unreadable
+                ptr = (uint8_t *)(((uintptr_t)ptr + 0x1000) & ~0xFFF);
+                continue;
+            }
+            
+            if (magic == METADATA_MAGIC) {
+                uint32_t version = 0;
+                if (!safe_read_uint32(ptr + 4, &version)) {
+                    ptr += 4;
+                    continue;
+                }
+                
+                // Verify it's metadata by checking version (Unity versions 24-31)
                 if (version >= 24 && version <= 31) {
                     LOGI("Found metadata at %p, version %d", ptr, version);
                     
-                    // Estimate metadata size from header
-                    // In metadata v29, we can read the last offset to estimate size
-                    // For safety, we'll dump up to 100MB or until end of region
-                    size_t max_size = (uint8_t *)end - ptr;
+                    // Calculate available size in this region
+                    size_t max_size = region_end - ptr;
                     if (max_size > 100 * 1024 * 1024) {
                         max_size = 100 * 1024 * 1024;
                     }
                     
-                    // Try to find actual size by scanning the header
-                    // The header contains pairs of (offset, count) for various tables
-                    // The largest offset + its data size gives us the total size
+                    // Try to read header to estimate size
                     size_t estimated_size = 0;
-                    uint32_t *header = (uint32_t *)ptr;
                     
-                    // Scan header for the largest offset (they're in pairs: offset, count)
-                    // Header has about 30 pairs of values
-                    for (int i = 2; i < 60; i += 2) {
-                        uint32_t offset = header[i];
-                        uint32_t count = header[i + 1];
-                        if (offset > 0 && offset < max_size) {
-                            // Estimate: offset + count * average_entry_size
-                            size_t potential_end = offset + count * 32; // rough estimate
-                            if (potential_end > estimated_size && potential_end < max_size) {
-                                estimated_size = potential_end;
-                            }
+                    // Read stringLiteralDataOffset (offset 8) and stringLiteralDataSize (offset 12)
+                    // These are typically near the end of metadata
+                    uint32_t str_offset = 0, str_size = 0;
+                    if (safe_read_uint32(ptr + 8, &str_offset) && 
+                        safe_read_uint32(ptr + 12, &str_size)) {
+                        estimated_size = str_offset + str_size;
+                        LOGI("String data ends at %zu", estimated_size);
+                    }
+                    
+                    // Also check metadataUsagesOffset which is usually the last data
+                    uint32_t meta_offset = 0, meta_count = 0;
+                    if (safe_read_uint32(ptr + 0x78, &meta_offset) &&
+                        safe_read_uint32(ptr + 0x7C, &meta_count)) {
+                        size_t meta_end = meta_offset + meta_count * 4;
+                        if (meta_end > estimated_size && meta_end < max_size) {
+                            estimated_size = meta_end;
+                            LOGI("Metadata usages ends at %zu", estimated_size);
                         }
                     }
                     
-                    // If we couldn't estimate, use a reasonable default
-                    if (estimated_size < 0x100000) {
+                    // If estimation failed, use a reasonable size
+                    if (estimated_size < 0x100000 || estimated_size > max_size) {
                         estimated_size = max_size;
                     }
                     
-                    // Round up to nearest 4KB
+                    // Round up to 4KB
                     estimated_size = (estimated_size + 0xFFF) & ~0xFFF;
                     
                     LOGI("Dumping %zu bytes of metadata", estimated_size);
                     
                     // Write to file
                     auto metaPath = std::string(outDir).append("/files/global-metadata.dat");
-                    std::ofstream metaStream(metaPath, std::ios::binary);
-                    if (metaStream) {
-                        metaStream.write((char *)ptr, estimated_size);
-                        metaStream.close();
-                        LOGI("Metadata dumped to %s", metaPath.c_str());
+                    FILE *outFile = fopen(metaPath.c_str(), "wb");
+                    if (outFile) {
+                        // Write in chunks to handle potential read errors
+                        size_t written = 0;
+                        size_t chunk_size = 0x10000; // 64KB chunks
+                        
+                        while (written < estimated_size) {
+                            size_t to_write = estimated_size - written;
+                            if (to_write > chunk_size) to_write = chunk_size;
+                            
+                            if (is_memory_readable(ptr + written, to_write)) {
+                                fwrite(ptr + written, 1, to_write, outFile);
+                                written += to_write;
+                            } else {
+                                LOGW("Memory became unreadable at offset %zu, stopping", written);
+                                break;
+                            }
+                        }
+                        
+                        fclose(outFile);
+                        LOGI("Metadata dumped to %s (%zu bytes)", metaPath.c_str(), written);
                         found = true;
                     } else {
-                        LOGE("Failed to create metadata output file");
+                        LOGE("Failed to create metadata output file: %s", metaPath.c_str());
                     }
                     
                     break;
