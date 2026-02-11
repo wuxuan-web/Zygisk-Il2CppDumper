@@ -12,10 +12,17 @@
 #include <sstream>
 #include <fstream>
 #include <unistd.h>
+#include <sys/mman.h>
 #include "xdl.h"
 #include "log.h"
 #include "il2cpp-tabledefs.h"
 #include "il2cpp-class.h"
+
+// Metadata magic number: AF 1B B1 FA
+#define METADATA_MAGIC 0xFAB11BAF
+
+// Forward declaration
+static void dump_metadata(const char *outDir);
 
 #define DO_API(r, n, p) r (*n) p
 
@@ -426,4 +433,117 @@ void il2cpp_dump(const char *outDir) {
     }
     outStream.close();
     LOGI("dump done!");
+    
+    // Dump decrypted metadata from memory
+    dump_metadata(outDir);
+}
+
+// Search for metadata in memory and dump it
+static void dump_metadata(const char *outDir) {
+    LOGI("Searching for decrypted metadata in memory...");
+    
+    FILE *maps = fopen("/proc/self/maps", "r");
+    if (!maps) {
+        LOGE("Failed to open /proc/self/maps");
+        return;
+    }
+    
+    char line[512];
+    bool found = false;
+    
+    while (fgets(line, sizeof(line), maps)) {
+        // Parse memory region
+        unsigned long start, end;
+        char perms[5];
+        if (sscanf(line, "%lx-%lx %4s", &start, &end, perms) != 3) {
+            continue;
+        }
+        
+        // Only search readable regions
+        if (perms[0] != 'r') {
+            continue;
+        }
+        
+        // Skip small regions (metadata is usually > 1MB)
+        size_t size = end - start;
+        if (size < 0x100000) {
+            continue;
+        }
+        
+        // Search for metadata magic in this region
+        uint8_t *ptr = (uint8_t *)start;
+        uint8_t *region_end = (uint8_t *)end - 4;
+        
+        while (ptr < region_end) {
+            // Check for magic number
+            if (*(uint32_t *)ptr == METADATA_MAGIC) {
+                // Verify it's metadata by checking version
+                uint32_t version = *(uint32_t *)(ptr + 4);
+                if (version >= 24 && version <= 31) {
+                    LOGI("Found metadata at %p, version %d", ptr, version);
+                    
+                    // Estimate metadata size from header
+                    // In metadata v29, we can read the last offset to estimate size
+                    // For safety, we'll dump up to 100MB or until end of region
+                    size_t max_size = (uint8_t *)end - ptr;
+                    if (max_size > 100 * 1024 * 1024) {
+                        max_size = 100 * 1024 * 1024;
+                    }
+                    
+                    // Try to find actual size by scanning the header
+                    // The header contains pairs of (offset, count) for various tables
+                    // The largest offset + its data size gives us the total size
+                    size_t estimated_size = 0;
+                    uint32_t *header = (uint32_t *)ptr;
+                    
+                    // Scan header for the largest offset (they're in pairs: offset, count)
+                    // Header has about 30 pairs of values
+                    for (int i = 2; i < 60; i += 2) {
+                        uint32_t offset = header[i];
+                        uint32_t count = header[i + 1];
+                        if (offset > 0 && offset < max_size) {
+                            // Estimate: offset + count * average_entry_size
+                            size_t potential_end = offset + count * 32; // rough estimate
+                            if (potential_end > estimated_size && potential_end < max_size) {
+                                estimated_size = potential_end;
+                            }
+                        }
+                    }
+                    
+                    // If we couldn't estimate, use a reasonable default
+                    if (estimated_size < 0x100000) {
+                        estimated_size = max_size;
+                    }
+                    
+                    // Round up to nearest 4KB
+                    estimated_size = (estimated_size + 0xFFF) & ~0xFFF;
+                    
+                    LOGI("Dumping %zu bytes of metadata", estimated_size);
+                    
+                    // Write to file
+                    auto metaPath = std::string(outDir).append("/files/global-metadata.dat");
+                    std::ofstream metaStream(metaPath, std::ios::binary);
+                    if (metaStream) {
+                        metaStream.write((char *)ptr, estimated_size);
+                        metaStream.close();
+                        LOGI("Metadata dumped to %s", metaPath.c_str());
+                        found = true;
+                    } else {
+                        LOGE("Failed to create metadata output file");
+                    }
+                    
+                    break;
+                }
+            }
+            ptr += 4; // Aligned search
+        }
+        
+        if (found) break;
+    }
+    
+    fclose(maps);
+    
+    if (!found) {
+        LOGW("Decrypted metadata not found in memory");
+    }
 }
