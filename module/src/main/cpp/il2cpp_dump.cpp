@@ -464,8 +464,9 @@ static bool safe_read_uint32(void *addr, uint32_t *out) {
 }
 
 // Known RVA offset for metadata pointer (game-specific, from IDA analysis)
-// This is the offset of qword_5CE4148 from libil2cpp base
-#define METADATA_PTR_RVA 0x5CE4148
+// This is the offset of qword_5ABE998 (s_GlobalMetadata) from libil2cpp base
+// Found in MetadataCache initialization function at 0x20B5DCC
+#define METADATA_PTR_RVA 0x5ABE998
 
 // Dump metadata from known pointer location
 static bool dump_metadata_from_pointer(const char *outDir, uint64_t base) {
