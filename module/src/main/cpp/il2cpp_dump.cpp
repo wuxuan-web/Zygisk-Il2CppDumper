@@ -436,6 +436,8 @@ void il2cpp_dump(const char *outDir) {
     LOGI("dump done!");
     
     // Dump decrypted metadata from memory
+    // Wait a bit for metadata to be fully initialized
+    sleep(2);
     dump_metadata(outDir);
 }
 
@@ -588,8 +590,10 @@ static void dump_metadata(const char *outDir) {
         }
         
         if (perms[0] != 'r') continue;
-        if (strstr(path, "[vdso]") || strstr(path, "[vvar]") || 
-            strstr(path, "/dev/") || strstr(path, "/system/")) continue;
+        // Skip certain regions but keep /dev/zero (metadata may be there)
+        if (strstr(path, "[vdso]") || strstr(path, "[vvar]") || strstr(path, "/system/")) continue;
+        // Skip /dev/ except /dev/zero
+        if (strstr(path, "/dev/") && !strstr(path, "/dev/zero")) continue;
         
         size_t size = end - start;
         if (size < 0x100000 || size > 0x20000000) continue;
@@ -600,15 +604,12 @@ static void dump_metadata(const char *outDir) {
         uint8_t *region_end = (uint8_t *)end - 8;
         
         while (ptr < region_end) {
-            uint32_t magic = 0;
-            if (!safe_read_uint32(ptr, &magic)) {
-                ptr = (uint8_t *)(((uintptr_t)ptr + 0x1000) & ~0xFFF);
-                continue;
-            }
+            // Direct memory read - we're in the same process
+            uint32_t magic = *(uint32_t *)ptr;
             
             if (magic == METADATA_MAGIC) {
-                uint32_t version = 0;
-                if (safe_read_uint32(ptr + 4, &version) && version >= 24 && version <= 31) {
+                uint32_t version = *(uint32_t *)(ptr + 4);
+                if (version >= 24 && version <= 31) {
                     LOGI("Found metadata at %p, version %d", ptr, version);
                     
                     size_t max_size = region_end - ptr;
@@ -617,17 +618,10 @@ static void dump_metadata(const char *outDir) {
                     auto metaPath = std::string(outDir).append("/files/global-metadata.dat");
                     FILE *outFile = fopen(metaPath.c_str(), "wb");
                     if (outFile) {
-                        uint8_t *buffer = (uint8_t *)malloc(max_size);
-                        if (buffer) {
-                            ssize_t bytes_read = safe_read_mem(ptr, buffer, max_size);
-                            if (bytes_read > 0) {
-                                fwrite(buffer, 1, bytes_read, outFile);
-                                LOGI("Metadata dumped to %s (%zd bytes)", metaPath.c_str(), bytes_read);
-                                found = true;
-                            }
-                            free(buffer);
-                        }
+                        fwrite(ptr, 1, max_size, outFile);
                         fclose(outFile);
+                        LOGI("Metadata dumped to %s (%zu bytes)", metaPath.c_str(), max_size);
+                        found = true;
                     }
                     break;
                 }
