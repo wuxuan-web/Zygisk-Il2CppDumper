@@ -472,7 +472,7 @@ static bool dump_metadata_from_pointer(const char *outDir, uint64_t base) {
     
     uint64_t metadata_ptr = 0;
     if (safe_read_mem((void *)ptr_addr, &metadata_ptr, sizeof(uint64_t)) != sizeof(uint64_t)) {
-        LOGW("Failed to read metadata pointer from 0x%lx", ptr_addr);
+        LOGW("Failed to read metadata pointer from 0x%" PRIx64, ptr_addr);
         return false;
     }
     
@@ -481,12 +481,12 @@ static bool dump_metadata_from_pointer(const char *outDir, uint64_t base) {
         return false;
     }
     
-    LOGI("Metadata pointer at 0x%lx = 0x%lx", ptr_addr, metadata_ptr);
+    LOGI("Metadata pointer at 0x%" PRIx64 " = 0x%" PRIx64, ptr_addr, metadata_ptr);
     
     // Read and verify magic
     uint32_t magic = 0;
     if (!safe_read_uint32((void *)metadata_ptr, &magic)) {
-        LOGW("Failed to read magic from metadata at 0x%lx", metadata_ptr);
+        LOGW("Failed to read magic from metadata at 0x%" PRIx64, metadata_ptr);
         return false;
     }
     
@@ -497,7 +497,7 @@ static bool dump_metadata_from_pointer(const char *outDir, uint64_t base) {
     
     uint32_t version = 0;
     safe_read_uint32((void *)(metadata_ptr + 4), &version);
-    LOGI("Found metadata at 0x%lx, magic=0x%x, version=%d", metadata_ptr, magic, version);
+    LOGI("Found metadata at 0x%" PRIx64 ", magic=0x%x, version=%d", metadata_ptr, magic, version);
     
     // Read header to estimate size - scan for largest offset
     size_t estimated_size = 0;
