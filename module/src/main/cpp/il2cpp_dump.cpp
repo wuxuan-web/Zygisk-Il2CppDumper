@@ -454,7 +454,8 @@ static ssize_t safe_read_mem(void *addr, void *buf, size_t size) {
     if (g_mem_fd < 0 && !open_proc_mem()) {
         return -1;
     }
-    return pread(g_mem_fd, buf, size, (off_t)(uintptr_t)addr);
+    // Use pread64 for 64-bit offsets (required on 32-bit platforms)
+    return pread64(g_mem_fd, buf, size, (off64_t)(uintptr_t)addr);
 }
 
 // Safely read uint32 from memory
@@ -470,10 +471,21 @@ static bool safe_read_uint32(void *addr, uint32_t *out) {
 static bool dump_metadata_from_pointer(const char *outDir, uint64_t base) {
     uint64_t ptr_addr = base + METADATA_PTR_RVA;
     
+    // Try direct memory read first (we're in the same process)
     uint64_t metadata_ptr = 0;
-    if (safe_read_mem((void *)ptr_addr, &metadata_ptr, sizeof(uint64_t)) != sizeof(uint64_t)) {
-        LOGW("Failed to read metadata pointer from 0x%" PRIx64, ptr_addr);
-        return false;
+    uint64_t *ptr_location = (uint64_t *)ptr_addr;
+    
+    LOGI("Reading metadata pointer from 0x%" PRIx64, ptr_addr);
+    
+    // Direct read - should work since we're in the same process
+    metadata_ptr = *ptr_location;
+    
+    if (!metadata_ptr) {
+        // Try /proc/self/mem as fallback
+        if (safe_read_mem((void *)ptr_addr, &metadata_ptr, sizeof(uint64_t)) != sizeof(uint64_t)) {
+            LOGW("Failed to read metadata pointer from 0x%" PRIx64, ptr_addr);
+            return false;
+        }
     }
     
     if (!metadata_ptr) {
