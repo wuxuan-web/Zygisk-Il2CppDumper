@@ -13,8 +13,7 @@
 #include <fstream>
 #include <unistd.h>
 #include <sys/mman.h>
-#include <signal.h>
-#include <setjmp.h>
+#include <fcntl.h>
 #include "xdl.h"
 #include "log.h"
 #include "il2cpp-tabledefs.h"
@@ -440,68 +439,27 @@ void il2cpp_dump(const char *outDir) {
     dump_metadata(outDir);
 }
 
-// Signal handler for safe memory reading
-static sigjmp_buf jump_buffer;
-static volatile sig_atomic_t can_read = 0;
+// Global fd for /proc/self/mem
+static int g_mem_fd = -1;
 
-static void segv_handler(int sig) {
-    if (can_read) {
-        siglongjmp(jump_buffer, 1);
-    }
+// Open /proc/self/mem for safe reading
+static bool open_proc_mem() {
+    if (g_mem_fd >= 0) return true;
+    g_mem_fd = open("/proc/self/mem", O_RDONLY);
+    return g_mem_fd >= 0;
 }
 
-// Safely check if memory is readable
-static bool is_memory_readable(void *addr, size_t size) {
-    // Use mincore to check if pages are mapped
-    size_t page_size = sysconf(_SC_PAGESIZE);
-    void *page_addr = (void *)((uintptr_t)addr & ~(page_size - 1));
-    size_t pages = (size + page_size - 1) / page_size;
-    
-    unsigned char *vec = (unsigned char *)malloc(pages);
-    if (!vec) return false;
-    
-    int result = mincore(page_addr, pages * page_size, vec);
-    free(vec);
-    
-    // mincore returns 0 on success (pages are mapped)
-    return (result == 0);
+// Safely read from memory using /proc/self/mem (won't crash on bad addresses)
+static ssize_t safe_read_mem(void *addr, void *buf, size_t size) {
+    if (g_mem_fd < 0 && !open_proc_mem()) {
+        return -1;
+    }
+    return pread(g_mem_fd, buf, size, (off_t)(uintptr_t)addr);
 }
 
 // Safely read uint32 from memory
 static bool safe_read_uint32(void *addr, uint32_t *out) {
-    // First check if the page is mapped
-    if (!is_memory_readable(addr, 4)) {
-        return false;
-    }
-    
-    // Set up signal handler
-    struct sigaction sa, old_sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = segv_handler;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;
-    
-    if (sigaction(SIGSEGV, &sa, &old_sa) < 0) {
-        return false;
-    }
-    if (sigaction(SIGBUS, &sa, &old_sa) < 0) {
-        sigaction(SIGSEGV, &old_sa, nullptr);
-        return false;
-    }
-    
-    bool success = false;
-    can_read = 1;
-    
-    if (sigsetjmp(jump_buffer, 1) == 0) {
-        *out = *(volatile uint32_t *)addr;
-        success = true;
-    }
-    
-    can_read = 0;
-    sigaction(SIGSEGV, &old_sa, nullptr);
-    sigaction(SIGBUS, &old_sa, nullptr);
-    
-    return success;
+    return safe_read_mem(addr, out, sizeof(uint32_t)) == sizeof(uint32_t);
 }
 
 // Search for metadata in memory and dump it
@@ -614,26 +572,22 @@ static void dump_metadata(const char *outDir) {
                     auto metaPath = std::string(outDir).append("/files/global-metadata.dat");
                     FILE *outFile = fopen(metaPath.c_str(), "wb");
                     if (outFile) {
-                        // Write in chunks to handle potential read errors
-                        size_t written = 0;
-                        size_t chunk_size = 0x10000; // 64KB chunks
-                        
-                        while (written < estimated_size) {
-                            size_t to_write = estimated_size - written;
-                            if (to_write > chunk_size) to_write = chunk_size;
-                            
-                            if (is_memory_readable(ptr + written, to_write)) {
-                                fwrite(ptr + written, 1, to_write, outFile);
-                                written += to_write;
+                        // Allocate buffer and read via /proc/self/mem
+                        uint8_t *buffer = (uint8_t *)malloc(estimated_size);
+                        if (buffer) {
+                            ssize_t bytes_read = safe_read_mem(ptr, buffer, estimated_size);
+                            if (bytes_read > 0) {
+                                fwrite(buffer, 1, bytes_read, outFile);
+                                LOGI("Metadata dumped to %s (%zd bytes)", metaPath.c_str(), bytes_read);
+                                found = true;
                             } else {
-                                LOGW("Memory became unreadable at offset %zu, stopping", written);
-                                break;
+                                LOGE("Failed to read metadata from memory");
                             }
+                            free(buffer);
+                        } else {
+                            LOGE("Failed to allocate buffer for metadata");
                         }
-                        
                         fclose(outFile);
-                        LOGI("Metadata dumped to %s (%zu bytes)", metaPath.c_str(), written);
-                        found = true;
                     } else {
                         LOGE("Failed to create metadata output file: %s", metaPath.c_str());
                     }
