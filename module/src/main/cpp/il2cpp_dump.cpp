@@ -462,9 +462,116 @@ static bool safe_read_uint32(void *addr, uint32_t *out) {
     return safe_read_mem(addr, out, sizeof(uint32_t)) == sizeof(uint32_t);
 }
 
+// Known RVA offset for metadata pointer (game-specific, from IDA analysis)
+// This is the offset of qword_5CE4148 from libil2cpp base
+#define METADATA_PTR_RVA 0x5CE4148
+
+// Dump metadata from known pointer location
+static bool dump_metadata_from_pointer(const char *outDir, uint64_t base) {
+    uint64_t ptr_addr = base + METADATA_PTR_RVA;
+    
+    uint64_t metadata_ptr = 0;
+    if (safe_read_mem((void *)ptr_addr, &metadata_ptr, sizeof(uint64_t)) != sizeof(uint64_t)) {
+        LOGW("Failed to read metadata pointer from 0x%lx", ptr_addr);
+        return false;
+    }
+    
+    if (!metadata_ptr) {
+        LOGW("Metadata pointer is null");
+        return false;
+    }
+    
+    LOGI("Metadata pointer at 0x%lx = 0x%lx", ptr_addr, metadata_ptr);
+    
+    // Read and verify magic
+    uint32_t magic = 0;
+    if (!safe_read_uint32((void *)metadata_ptr, &magic)) {
+        LOGW("Failed to read magic from metadata at 0x%lx", metadata_ptr);
+        return false;
+    }
+    
+    if (magic != METADATA_MAGIC) {
+        LOGW("Invalid magic 0x%x at metadata pointer (expected 0x%x)", magic, METADATA_MAGIC);
+        return false;
+    }
+    
+    uint32_t version = 0;
+    safe_read_uint32((void *)(metadata_ptr + 4), &version);
+    LOGI("Found metadata at 0x%lx, magic=0x%x, version=%d", metadata_ptr, magic, version);
+    
+    // Read header to estimate size - scan for largest offset
+    size_t estimated_size = 0;
+    uint32_t header[64];
+    if (safe_read_mem((void *)metadata_ptr, header, sizeof(header)) == sizeof(header)) {
+        // Header contains offset/size pairs, find the largest offset + size
+        for (int i = 2; i < 60; i += 2) {
+            uint32_t offset = header[i];
+            uint32_t count = header[i + 1];
+            if (offset > 0 && offset < 100 * 1024 * 1024) {
+                size_t end = offset + count * 8; // rough estimate
+                if (end > estimated_size) estimated_size = end;
+            }
+        }
+    }
+    
+    // Fallback: try to read metadata size from header fields
+    if (estimated_size < 1024 * 1024) {
+        // Read stringLiteralDataOffset + stringLiteralDataSize
+        uint32_t str_off = 0, str_size = 0;
+        safe_read_uint32((void *)(metadata_ptr + 8), &str_off);
+        safe_read_uint32((void *)(metadata_ptr + 12), &str_size);
+        if (str_off > 0 && str_size > 0) {
+            estimated_size = str_off + str_size;
+        }
+    }
+    
+    // Default to 50MB if can't estimate
+    if (estimated_size < 1024 * 1024) {
+        estimated_size = 50 * 1024 * 1024;
+    }
+    
+    // Round up
+    estimated_size = (estimated_size + 0xFFF) & ~0xFFF;
+    LOGI("Estimated metadata size: %zu bytes", estimated_size);
+    
+    // Dump to file
+    auto metaPath = std::string(outDir).append("/files/global-metadata.dat");
+    FILE *outFile = fopen(metaPath.c_str(), "wb");
+    if (!outFile) {
+        LOGE("Failed to create %s", metaPath.c_str());
+        return false;
+    }
+    
+    uint8_t *buffer = (uint8_t *)malloc(estimated_size);
+    if (!buffer) {
+        LOGE("Failed to allocate %zu bytes", estimated_size);
+        fclose(outFile);
+        return false;
+    }
+    
+    ssize_t bytes_read = safe_read_mem((void *)metadata_ptr, buffer, estimated_size);
+    if (bytes_read > 0) {
+        fwrite(buffer, 1, bytes_read, outFile);
+        LOGI("Metadata dumped to %s (%zd bytes)", metaPath.c_str(), bytes_read);
+    } else {
+        LOGE("Failed to read metadata");
+    }
+    
+    free(buffer);
+    fclose(outFile);
+    return bytes_read > 0;
+}
+
 // Search for metadata in memory and dump it
 static void dump_metadata(const char *outDir) {
-    LOGI("Searching for decrypted metadata in memory...");
+    LOGI("Attempting to dump decrypted metadata...");
+    
+    // First try to read from known pointer location (game-specific)
+    if (il2cpp_base && dump_metadata_from_pointer(outDir, il2cpp_base)) {
+        return;
+    }
+    
+    LOGI("Falling back to memory scan...");
     
     FILE *maps = fopen("/proc/self/maps", "r");
     if (!maps) {
@@ -476,7 +583,6 @@ static void dump_metadata(const char *outDir) {
     bool found = false;
     
     while (fgets(line, sizeof(line), maps)) {
-        // Parse memory region
         unsigned long start, end;
         char perms[5];
         char path[256] = {0};
@@ -485,119 +591,53 @@ static void dump_metadata(const char *outDir) {
             continue;
         }
         
-        // Only search readable regions
-        if (perms[0] != 'r') {
-            continue;
-        }
-        
-        // Skip certain regions that are unlikely to contain metadata
+        if (perms[0] != 'r') continue;
         if (strstr(path, "[vdso]") || strstr(path, "[vvar]") || 
-            strstr(path, "/dev/") || strstr(path, "/system/")) {
-            continue;
-        }
+            strstr(path, "/dev/") || strstr(path, "/system/")) continue;
         
-        // Skip small regions (metadata is usually > 10MB)
         size_t size = end - start;
-        if (size < 0x100000 || size > 0x20000000) { // 1MB - 512MB
-            continue;
-        }
+        if (size < 0x100000 || size > 0x20000000) continue;
         
         LOGI("Scanning region %lx-%lx (%zu MB) %s", start, end, size / (1024*1024), path);
         
-        // Search for metadata magic in this region
         uint8_t *ptr = (uint8_t *)start;
-        uint8_t *region_end = (uint8_t *)end - 8; // Need at least 8 bytes for magic + version
+        uint8_t *region_end = (uint8_t *)end - 8;
         
         while (ptr < region_end) {
             uint32_t magic = 0;
-            
-            // Safely read magic number
             if (!safe_read_uint32(ptr, &magic)) {
-                // Skip this page if unreadable
                 ptr = (uint8_t *)(((uintptr_t)ptr + 0x1000) & ~0xFFF);
                 continue;
             }
             
             if (magic == METADATA_MAGIC) {
                 uint32_t version = 0;
-                if (!safe_read_uint32(ptr + 4, &version)) {
-                    ptr += 4;
-                    continue;
-                }
-                
-                // Verify it's metadata by checking version (Unity versions 24-31)
-                if (version >= 24 && version <= 31) {
+                if (safe_read_uint32(ptr + 4, &version) && version >= 24 && version <= 31) {
                     LOGI("Found metadata at %p, version %d", ptr, version);
                     
-                    // Calculate available size in this region
                     size_t max_size = region_end - ptr;
-                    if (max_size > 100 * 1024 * 1024) {
-                        max_size = 100 * 1024 * 1024;
-                    }
+                    if (max_size > 100 * 1024 * 1024) max_size = 100 * 1024 * 1024;
                     
-                    // Try to read header to estimate size
-                    size_t estimated_size = 0;
-                    
-                    // Read stringLiteralDataOffset (offset 8) and stringLiteralDataSize (offset 12)
-                    // These are typically near the end of metadata
-                    uint32_t str_offset = 0, str_size = 0;
-                    if (safe_read_uint32(ptr + 8, &str_offset) && 
-                        safe_read_uint32(ptr + 12, &str_size)) {
-                        estimated_size = str_offset + str_size;
-                        LOGI("String data ends at %zu", estimated_size);
-                    }
-                    
-                    // Also check metadataUsagesOffset which is usually the last data
-                    uint32_t meta_offset = 0, meta_count = 0;
-                    if (safe_read_uint32(ptr + 0x78, &meta_offset) &&
-                        safe_read_uint32(ptr + 0x7C, &meta_count)) {
-                        size_t meta_end = meta_offset + meta_count * 4;
-                        if (meta_end > estimated_size && meta_end < max_size) {
-                            estimated_size = meta_end;
-                            LOGI("Metadata usages ends at %zu", estimated_size);
-                        }
-                    }
-                    
-                    // If estimation failed, use a reasonable size
-                    if (estimated_size < 0x100000 || estimated_size > max_size) {
-                        estimated_size = max_size;
-                    }
-                    
-                    // Round up to 4KB
-                    estimated_size = (estimated_size + 0xFFF) & ~0xFFF;
-                    
-                    LOGI("Dumping %zu bytes of metadata", estimated_size);
-                    
-                    // Write to file
                     auto metaPath = std::string(outDir).append("/files/global-metadata.dat");
                     FILE *outFile = fopen(metaPath.c_str(), "wb");
                     if (outFile) {
-                        // Allocate buffer and read via /proc/self/mem
-                        uint8_t *buffer = (uint8_t *)malloc(estimated_size);
+                        uint8_t *buffer = (uint8_t *)malloc(max_size);
                         if (buffer) {
-                            ssize_t bytes_read = safe_read_mem(ptr, buffer, estimated_size);
+                            ssize_t bytes_read = safe_read_mem(ptr, buffer, max_size);
                             if (bytes_read > 0) {
                                 fwrite(buffer, 1, bytes_read, outFile);
                                 LOGI("Metadata dumped to %s (%zd bytes)", metaPath.c_str(), bytes_read);
                                 found = true;
-                            } else {
-                                LOGE("Failed to read metadata from memory");
                             }
                             free(buffer);
-                        } else {
-                            LOGE("Failed to allocate buffer for metadata");
                         }
                         fclose(outFile);
-                    } else {
-                        LOGE("Failed to create metadata output file: %s", metaPath.c_str());
                     }
-                    
                     break;
                 }
             }
-            ptr += 4; // Aligned search
+            ptr += 4;
         }
-        
         if (found) break;
     }
     
