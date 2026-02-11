@@ -496,43 +496,38 @@ static bool dump_metadata_from_pointer(const char *outDir, uint64_t base) {
     
     LOGI("Metadata pointer at 0x%" PRIx64 " = 0x%" PRIx64, ptr_addr, metadata_ptr);
     
-    // Read and verify magic
-    uint32_t magic = 0;
-    if (!safe_read_uint32((void *)metadata_ptr, &magic)) {
-        LOGW("Failed to read magic from metadata at 0x%" PRIx64, metadata_ptr);
-        return false;
-    }
+    // Read and verify magic - use direct memory read since we're in the same process
+    uint32_t *magic_ptr = (uint32_t *)metadata_ptr;
+    uint32_t magic = *magic_ptr;
+    LOGI("Read magic: 0x%x", magic);
     
     if (magic != METADATA_MAGIC) {
         LOGW("Invalid magic 0x%x at metadata pointer (expected 0x%x)", magic, METADATA_MAGIC);
         return false;
     }
     
-    uint32_t version = 0;
-    safe_read_uint32((void *)(metadata_ptr + 4), &version);
+    uint32_t version = *(uint32_t *)(metadata_ptr + 4);
     LOGI("Found metadata at 0x%" PRIx64 ", magic=0x%x, version=%d", metadata_ptr, magic, version);
     
     // Read header to estimate size - scan for largest offset
     size_t estimated_size = 0;
-    uint32_t header[64];
-    if (safe_read_mem((void *)metadata_ptr, header, sizeof(header)) == sizeof(header)) {
-        // Header contains offset/size pairs, find the largest offset + size
-        for (int i = 2; i < 60; i += 2) {
-            uint32_t offset = header[i];
-            uint32_t count = header[i + 1];
-            if (offset > 0 && offset < 100 * 1024 * 1024) {
-                size_t end = offset + count * 8; // rough estimate
-                if (end > estimated_size) estimated_size = end;
-            }
+    uint32_t *header = (uint32_t *)metadata_ptr;
+    
+    // Header contains offset/size pairs, find the largest offset + size
+    for (int i = 2; i < 60; i += 2) {
+        uint32_t offset = header[i];
+        uint32_t count = header[i + 1];
+        if (offset > 0 && offset < 100 * 1024 * 1024) {
+            size_t end = offset + count * 8; // rough estimate
+            if (end > estimated_size) estimated_size = end;
         }
     }
     
     // Fallback: try to read metadata size from header fields
     if (estimated_size < 1024 * 1024) {
         // Read stringLiteralDataOffset + stringLiteralDataSize
-        uint32_t str_off = 0, str_size = 0;
-        safe_read_uint32((void *)(metadata_ptr + 8), &str_off);
-        safe_read_uint32((void *)(metadata_ptr + 12), &str_size);
+        uint32_t str_off = header[2];  // offset 8
+        uint32_t str_size = header[3]; // offset 12
         if (str_off > 0 && str_size > 0) {
             estimated_size = str_off + str_size;
         }
@@ -555,24 +550,12 @@ static bool dump_metadata_from_pointer(const char *outDir, uint64_t base) {
         return false;
     }
     
-    uint8_t *buffer = (uint8_t *)malloc(estimated_size);
-    if (!buffer) {
-        LOGE("Failed to allocate %zu bytes", estimated_size);
-        fclose(outFile);
-        return false;
-    }
-    
-    ssize_t bytes_read = safe_read_mem((void *)metadata_ptr, buffer, estimated_size);
-    if (bytes_read > 0) {
-        fwrite(buffer, 1, bytes_read, outFile);
-        LOGI("Metadata dumped to %s (%zd bytes)", metaPath.c_str(), bytes_read);
-    } else {
-        LOGE("Failed to read metadata");
-    }
-    
-    free(buffer);
+    // Write directly from memory - we're in the same process
+    fwrite((void *)metadata_ptr, 1, estimated_size, outFile);
     fclose(outFile);
-    return bytes_read > 0;
+    
+    LOGI("Metadata dumped to %s (%zu bytes)", metaPath.c_str(), estimated_size);
+    return true;
 }
 
 // Search for metadata in memory and dump it
