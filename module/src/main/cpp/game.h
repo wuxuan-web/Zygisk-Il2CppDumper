@@ -5,6 +5,7 @@
 #ifndef ZYGISK_IL2CPPDUMPER_GAME_H
 #define ZYGISK_IL2CPPDUMPER_GAME_H
 
-#define GamePackageName "com.scopely.monopolygo"
+#define GamePackageName "com.miHoYo.Yuanshen"
+#define GameLibName "libyuanshen.so"
 
 #endif //ZYGISK_IL2CPPDUMPER_GAME_H

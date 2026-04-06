@@ -3,6 +3,7 @@
 //
 
 #include "il2cpp_dump.h"
+#include "game.h"
 #include <dlfcn.h>
 #include <cstdlib>
 #include <cstring>
@@ -333,19 +334,34 @@ std::string dump_type(const Il2CppType *type) {
 void il2cpp_api_init(void *handle) {
     LOGI("il2cpp_handle: %p", handle);
     init_il2cpp_api(handle);
+
+    // Get base address from handle directly via dlinfo
+    Dl_info dlInfo;
+    if (dladdr(handle, &dlInfo)) {
+        il2cpp_base = reinterpret_cast<uint64_t>(dlInfo.dli_fbase);
+        LOGI("il2cpp_base (from handle): %" PRIx64, il2cpp_base);
+    }
+
     if (il2cpp_domain_get_assemblies) {
-        Dl_info dlInfo;
-        if (dladdr((void *) il2cpp_domain_get_assemblies, &dlInfo)) {
-            il2cpp_base = reinterpret_cast<uint64_t>(dlInfo.dli_fbase);
+        if (!il2cpp_base) {
+            if (dladdr((void *) il2cpp_domain_get_assemblies, &dlInfo)) {
+                il2cpp_base = reinterpret_cast<uint64_t>(dlInfo.dli_fbase);
+            }
         }
-        LOGI("il2cpp_base: %" PRIx64"", il2cpp_base);
+        LOGI("il2cpp_base: %" PRIx64, il2cpp_base);
     } else {
-        LOGE("Failed to initialize il2cpp api.");
+        LOGW("il2cpp_domain_get_assemblies not found (symbols may be obfuscated)");
+        LOGI("Will attempt metadata-only dump");
         return;
     }
+    int wait_count = 0;
     while (!il2cpp_is_vm_thread(nullptr)) {
         LOGI("Waiting for il2cpp_init...");
         sleep(1);
+        if (++wait_count > 30) {
+            LOGW("Timeout waiting for il2cpp_init");
+            return;
+        }
     }
     auto domain = il2cpp_domain_get();
     il2cpp_thread_attach(domain);
@@ -353,9 +369,30 @@ void il2cpp_api_init(void *handle) {
 
 void il2cpp_dump(const char *outDir) {
     LOGI("dumping...");
+
+    // Always attempt metadata dump first (works even with obfuscated symbols)
+    // Wait for the game to fully initialize and decrypt metadata
+    LOGI("Waiting for game initialization before metadata dump...");
+    sleep(10);
+    dump_metadata(outDir);
+
+    // Try API-based dump (will fail if symbols are obfuscated)
+    if (!il2cpp_domain_get_assemblies) {
+        LOGW("IL2CPP API not available (obfuscated symbols), skipping class dump");
+        return;
+    }
+
     size_t size;
     auto domain = il2cpp_domain_get();
+    if (!domain) {
+        LOGW("il2cpp_domain_get returned null");
+        return;
+    }
     auto assemblies = il2cpp_domain_get_assemblies(domain, &size);
+    if (!assemblies || size == 0) {
+        LOGW("No assemblies found");
+        return;
+    }
     std::stringstream imageOutput;
     for (int i = 0; i < size; ++i) {
         auto image = il2cpp_assembly_get_image(assemblies[i]);
@@ -434,206 +471,167 @@ void il2cpp_dump(const char *outDir) {
     }
     outStream.close();
     LOGI("dump done!");
-    
-    // Dump decrypted metadata from memory
-    // Wait a bit for metadata to be fully initialized
-    sleep(2);
-    dump_metadata(outDir);
 }
 
-// Global fd for /proc/self/mem
-static int g_mem_fd = -1;
+// MHY custom metadata magic: 4D 48 59 00
+#define MHY_MAGIC 0x0059484D
 
-// Open /proc/self/mem for safe reading
-static bool open_proc_mem() {
-    if (g_mem_fd >= 0) return true;
-    g_mem_fd = open("/proc/self/mem", O_RDONLY);
-    return g_mem_fd >= 0;
-}
-
-// Safely read from memory using /proc/self/mem (won't crash on bad addresses)
-static ssize_t safe_read_mem(void *addr, void *buf, size_t size) {
-    if (g_mem_fd < 0 && !open_proc_mem()) {
-        return -1;
-    }
-    // Use pread64 for 64-bit offsets (required on 32-bit platforms)
-    return pread64(g_mem_fd, buf, size, (off64_t)(uintptr_t)addr);
-}
-
-// Safely read uint32 from memory
-static bool safe_read_uint32(void *addr, uint32_t *out) {
-    return safe_read_mem(addr, out, sizeof(uint32_t)) == sizeof(uint32_t);
-}
-
-// Known RVA offset for metadata pointer (game-specific, from IDA analysis)
-// This is the offset of qword_5ABE998 (s_GlobalMetadata) from libil2cpp base
-// Found in MetadataCache initialization function at 0x20B5DCC
-#define METADATA_PTR_RVA 0x5ABE998
-
-// Dump metadata from known pointer location
-static bool dump_metadata_from_pointer(const char *outDir, uint64_t base) {
-    uint64_t ptr_addr = base + METADATA_PTR_RVA;
-    
-    // Try direct memory read first (we're in the same process)
-    uint64_t metadata_ptr = 0;
-    uint64_t *ptr_location = (uint64_t *)ptr_addr;
-    
-    LOGI("Reading metadata pointer from 0x%" PRIx64, ptr_addr);
-    
-    // Direct read - should work since we're in the same process
-    metadata_ptr = *ptr_location;
-    
-    if (!metadata_ptr) {
-        // Try /proc/self/mem as fallback
-        if (safe_read_mem((void *)ptr_addr, &metadata_ptr, sizeof(uint64_t)) != sizeof(uint64_t)) {
-            LOGW("Failed to read metadata pointer from 0x%" PRIx64, ptr_addr);
-            return false;
-        }
-    }
-    
-    if (!metadata_ptr) {
-        LOGW("Metadata pointer is null");
-        return false;
-    }
-    
-    LOGI("Metadata pointer at 0x%" PRIx64 " = 0x%" PRIx64, ptr_addr, metadata_ptr);
-    
-    // Read and verify magic - use direct memory read since we're in the same process
-    uint32_t *magic_ptr = (uint32_t *)metadata_ptr;
-    uint32_t magic = *magic_ptr;
-    LOGI("Read magic: 0x%x", magic);
-    
-    if (magic != METADATA_MAGIC) {
-        LOGW("Invalid magic 0x%x at metadata pointer (expected 0x%x)", magic, METADATA_MAGIC);
-        return false;
-    }
-    
-    uint32_t version = *(uint32_t *)(metadata_ptr + 4);
-    LOGI("Found metadata at 0x%" PRIx64 ", magic=0x%x, version=%d", metadata_ptr, magic, version);
-    
-    // Read header to estimate size - scan for largest offset
-    size_t estimated_size = 0;
-    uint32_t *header = (uint32_t *)metadata_ptr;
-    
-    // Header contains offset/size pairs, find the largest offset + size
-    for (int i = 2; i < 60; i += 2) {
-        uint32_t offset = header[i];
-        uint32_t count = header[i + 1];
-        if (offset > 0 && offset < 100 * 1024 * 1024) {
-            size_t end = offset + count * 8; // rough estimate
-            if (end > estimated_size) estimated_size = end;
-        }
-    }
-    
-    // Fallback: try to read metadata size from header fields
-    if (estimated_size < 1024 * 1024) {
-        // Read stringLiteralDataOffset + stringLiteralDataSize
-        uint32_t str_off = header[2];  // offset 8
-        uint32_t str_size = header[3]; // offset 12
-        if (str_off > 0 && str_size > 0) {
-            estimated_size = str_off + str_size;
-        }
-    }
-    
-    // Default to 50MB if can't estimate
-    if (estimated_size < 1024 * 1024) {
-        estimated_size = 50 * 1024 * 1024;
-    }
-    
-    // Round up
-    estimated_size = (estimated_size + 0xFFF) & ~0xFFF;
-    LOGI("Estimated metadata size: %zu bytes", estimated_size);
-    
-    // Dump to file
-    auto metaPath = std::string(outDir).append("/files/global-metadata.dat");
-    FILE *outFile = fopen(metaPath.c_str(), "wb");
+// Dump raw memory region to file
+static bool dump_region_to_file(const char *path, void *addr, size_t size) {
+    FILE *outFile = fopen(path, "wb");
     if (!outFile) {
-        LOGE("Failed to create %s", metaPath.c_str());
+        LOGE("Failed to create %s", path);
         return false;
     }
-    
-    // Write directly from memory - we're in the same process
-    fwrite((void *)metadata_ptr, 1, estimated_size, outFile);
+    // Write in chunks to avoid issues
+    size_t written = 0;
+    size_t chunk = 4 * 1024 * 1024;
+    uint8_t *ptr = (uint8_t *)addr;
+    while (written < size) {
+        size_t to_write = (size - written < chunk) ? (size - written) : chunk;
+        size_t w = fwrite(ptr + written, 1, to_write, outFile);
+        if (w == 0) break;
+        written += w;
+    }
     fclose(outFile);
-    
-    LOGI("Metadata dumped to %s (%zu bytes)", metaPath.c_str(), estimated_size);
-    return true;
+    LOGI("Dumped %zu bytes to %s", written, path);
+    return written > 0;
 }
 
 // Search for metadata in memory and dump it
 static void dump_metadata(const char *outDir) {
-    LOGI("Attempting to dump decrypted metadata...");
-    
-    // First try to read from known pointer location (game-specific)
-    if (il2cpp_base && dump_metadata_from_pointer(outDir, il2cpp_base)) {
-        return;
+    LOGI("Attempting to dump metadata from memory...");
+
+    // Get il2cpp base from /proc/self/maps if not set
+    if (!il2cpp_base) {
+        FILE *maps = fopen("/proc/self/maps", "r");
+        if (maps) {
+            char line[512];
+            while (fgets(line, sizeof(line), maps)) {
+                if (strstr(line, GameLibName) && strstr(line, "r-xp")) {
+                    unsigned long start;
+                    sscanf(line, "%lx-", &start);
+                    il2cpp_base = start;
+                    LOGI("Found %s base from maps: 0x%" PRIx64, GameLibName, il2cpp_base);
+                    break;
+                }
+            }
+            fclose(maps);
+        }
     }
-    
-    LOGI("Falling back to memory scan...");
-    
+
     FILE *maps = fopen("/proc/self/maps", "r");
     if (!maps) {
         LOGE("Failed to open /proc/self/maps");
         return;
     }
-    
+
     char line[512];
-    bool found = false;
-    
+    bool found_standard = false;
+    bool found_mhy = false;
+
     while (fgets(line, sizeof(line), maps)) {
         unsigned long start, end;
         char perms[5];
         char path[256] = {0};
-        
+
         if (sscanf(line, "%lx-%lx %4s %*s %*s %*s %255s", &start, &end, perms, path) < 3) {
             continue;
         }
-        
+
         if (perms[0] != 'r') continue;
-        // Skip certain regions but keep /dev/zero (metadata may be there)
-        if (strstr(path, "[vdso]") || strstr(path, "[vvar]") || strstr(path, "/system/")) continue;
-        // Skip /dev/ except /dev/zero
-        if (strstr(path, "/dev/") && !strstr(path, "/dev/zero")) continue;
-        
+        if (strstr(path, "[vdso]") || strstr(path, "[vvar]")) continue;
+
         size_t size = end - start;
         if (size < 0x100000 || size > 0x20000000) continue;
-        
-        LOGI("Scanning region %lx-%lx (%zu MB) %s", start, end, size / (1024*1024), path);
-        
+
         uint8_t *ptr = (uint8_t *)start;
         uint8_t *region_end = (uint8_t *)end - 8;
-        
+
         while (ptr < region_end) {
-            // Direct memory read - we're in the same process
             uint32_t magic = *(uint32_t *)ptr;
-            
-            if (magic == METADATA_MAGIC) {
+
+            // Check standard IL2CPP metadata magic
+            if (!found_standard && magic == METADATA_MAGIC) {
                 uint32_t version = *(uint32_t *)(ptr + 4);
-                if (version >= 24 && version <= 31) {
-                    LOGI("Found metadata at %p, version %d", ptr, version);
-                    
-                    size_t max_size = region_end - ptr;
-                    if (max_size > 100 * 1024 * 1024) max_size = 100 * 1024 * 1024;
-                    
-                    auto metaPath = std::string(outDir).append("/files/global-metadata.dat");
-                    FILE *outFile = fopen(metaPath.c_str(), "wb");
-                    if (outFile) {
-                        fwrite(ptr, 1, max_size, outFile);
-                        fclose(outFile);
-                        LOGI("Metadata dumped to %s (%zu bytes)", metaPath.c_str(), max_size);
-                        found = true;
+                if (version >= 16 && version <= 31) {
+                    LOGI("Found standard metadata at %p, version %d", ptr, version);
+
+                    // Calculate size from header
+                    size_t meta_size = 0;
+                    uint32_t *header = (uint32_t *)ptr;
+                    for (int i = 2; i < 60; i += 2) {
+                        uint32_t off = header[i];
+                        uint32_t sz = header[i + 1];
+                        if (off > 0 && off < 200 * 1024 * 1024 && sz > 0 && sz < 200 * 1024 * 1024) {
+                            size_t e = (size_t)off + sz;
+                            if (e > meta_size) meta_size = e;
+                        }
                     }
-                    break;
+                    if (meta_size < 1024 * 1024) meta_size = (size_t)(region_end - ptr);
+                    meta_size = (meta_size + 0xFFF) & ~0xFFF;
+
+                    // Dump to app data dir and sdcard
+                    auto appPath = std::string(outDir).append("/files/global-metadata-decrypted.dat");
+                    dump_region_to_file(appPath.c_str(), ptr, meta_size);
+                    dump_region_to_file("/sdcard/global-metadata-decrypted.dat", ptr, meta_size);
+
+                    found_standard = true;
                 }
             }
+
+            // Check MHY custom metadata magic
+            if (!found_mhy && magic == MHY_MAGIC) {
+                // Found MHY header - this is the encrypted metadata mapped in memory
+                // Dump the entire region containing it
+                size_t remaining = (size_t)(region_end - ptr);
+                if (remaining > 100 * 1024 * 1024) remaining = 100 * 1024 * 1024;
+
+                LOGI("Found MHY metadata at %p, dumping %zu bytes", ptr, remaining);
+                auto appPath = std::string(outDir).append("/files/global-metadata-mhy.dat");
+                dump_region_to_file(appPath.c_str(), ptr, remaining);
+                dump_region_to_file("/sdcard/global-metadata-mhy.dat", ptr, remaining);
+
+                found_mhy = true;
+            }
+
+            if (found_standard) break;
             ptr += 4;
         }
-        if (found) break;
+        if (found_standard) break;
     }
-    
+
     fclose(maps);
-    
-    if (!found) {
-        LOGW("Decrypted metadata not found in memory");
+
+    if (!found_standard && !found_mhy) {
+        LOGW("No metadata found in memory (standard or MHY format)");
+
+        // Last resort: dump the entire il2cpp data segment
+        if (il2cpp_base) {
+            LOGI("Dumping il2cpp data segments as fallback...");
+            FILE *maps2 = fopen("/proc/self/maps", "r");
+            if (maps2) {
+                int seg = 0;
+                while (fgets(line, sizeof(line), maps2)) {
+                    if (strstr(line, GameLibName) && line[strlen(line)-2] != 'x') {
+                        unsigned long start, end;
+                        char perms[5];
+                        sscanf(line, "%lx-%lx %4s", &start, &end, perms);
+                        if (perms[0] == 'r' && (end - start) > 1024 * 1024) {
+                            char segPath[256];
+                            snprintf(segPath, sizeof(segPath), "/sdcard/il2cpp_segment_%d_%s.bin", seg++, perms);
+                            dump_region_to_file(segPath, (void *)start, end - start);
+                        }
+                    }
+                }
+                fclose(maps2);
+            }
+        }
+    }
+
+    if (found_standard) {
+        LOGI("Decrypted metadata dumped successfully!");
+    } else if (found_mhy) {
+        LOGI("MHY encrypted metadata dumped (needs offline decryption)");
     }
 }
