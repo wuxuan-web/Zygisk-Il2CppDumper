@@ -372,8 +372,8 @@ void il2cpp_dump(const char *outDir) {
 
     // Always attempt metadata dump first (works even with obfuscated symbols)
     // Wait for the game to fully initialize and decrypt metadata
-    LOGI("Waiting for game initialization before metadata dump...");
-    sleep(10);
+    LOGI("Waiting for game initialization before metadata dump (60s)...");
+    sleep(60);
     dump_metadata(outDir);
 
     // Try API-based dump (will fail if symbols are obfuscated)
