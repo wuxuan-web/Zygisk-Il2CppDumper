@@ -21,6 +21,8 @@
 
 // Metadata magic number: AF 1B B1 FA
 #define METADATA_MAGIC 0xFAB11BAF
+// HTPX magic (NetHTProtect encrypted metadata): 48 54 50 58
+#define HTPX_MAGIC 0x58505448
 
 // Forward declaration
 static void dump_metadata(const char *outDir);
@@ -434,7 +436,47 @@ void il2cpp_dump(const char *outDir) {
     }
     outStream.close();
     LOGI("dump done!");
-    
+
+    // === dump method_rvas.txt with full name→RVA mapping ===
+    LOGI("dumping method RVAs...");
+    auto rvaPath = std::string(outDir).append("/files/method_rvas.txt");
+    std::ofstream rvaStream(rvaPath);
+    int totalRvas = 0;
+    for (int i = 0; i < size; ++i) {
+        auto image = il2cpp_assembly_get_image(assemblies[i]);
+        auto imageName = il2cpp_image_get_name(image);
+        if (il2cpp_image_get_class) {
+            auto classCount = il2cpp_image_get_class_count(image);
+            for (int j = 0; j < classCount; ++j) {
+                auto klass = const_cast<Il2CppClass *>(il2cpp_image_get_class(image, j));
+                if (!klass) continue;
+                if (il2cpp_class_init_all_method) {
+                    il2cpp_class_init_all_method(klass);
+                }
+                auto className = il2cpp_class_get_name(klass);
+                auto nameSpace = il2cpp_class_get_namespace(klass);
+                std::string fullName;
+                if (nameSpace && strlen(nameSpace) > 0) {
+                    fullName = std::string(nameSpace) + "." + className;
+                } else {
+                    fullName = className;
+                }
+                void *iter = nullptr;
+                while (auto method = il2cpp_class_get_methods(klass, &iter)) {
+                    if (method->methodPointer) {
+                        auto rva = (uint64_t)method->methodPointer - il2cpp_base;
+                        auto methodName = il2cpp_method_get_name(method);
+                        rvaStream << imageName << "|" << fullName << "|"
+                                  << methodName << "|0x" << std::hex << rva << "\n";
+                        totalRvas++;
+                    }
+                }
+            }
+        }
+    }
+    rvaStream.close();
+    LOGI("method_rvas.txt done! %d methods with RVA", totalRvas);
+
     // Dump decrypted metadata from memory
     // Wait a bit for metadata to be fully initialized
     sleep(2);
@@ -466,98 +508,14 @@ static bool safe_read_uint32(void *addr, uint32_t *out) {
 }
 
 // Known RVA offset for metadata pointer (game-specific, from IDA analysis)
-// This is the offset of qword_5ABE998 (s_GlobalMetadata) from libil2cpp base
-// Found in MetadataCache initialization function at 0x20B5DCC
-#define METADATA_PTR_RVA 0x5ABE998
+// ROK: not yet determined — skip direct pointer read, use memory scan
+// #define METADATA_PTR_RVA 0x0
 
-// Dump metadata from known pointer location
+// Dump metadata from known pointer location (disabled for ROK)
 static bool dump_metadata_from_pointer(const char *outDir, uint64_t base) {
-    uint64_t ptr_addr = base + METADATA_PTR_RVA;
-    
-    // Try direct memory read first (we're in the same process)
-    uint64_t metadata_ptr = 0;
-    uint64_t *ptr_location = (uint64_t *)ptr_addr;
-    
-    LOGI("Reading metadata pointer from 0x%" PRIx64, ptr_addr);
-    
-    // Direct read - should work since we're in the same process
-    metadata_ptr = *ptr_location;
-    
-    if (!metadata_ptr) {
-        // Try /proc/self/mem as fallback
-        if (safe_read_mem((void *)ptr_addr, &metadata_ptr, sizeof(uint64_t)) != sizeof(uint64_t)) {
-            LOGW("Failed to read metadata pointer from 0x%" PRIx64, ptr_addr);
-            return false;
-        }
-    }
-    
-    if (!metadata_ptr) {
-        LOGW("Metadata pointer is null");
-        return false;
-    }
-    
-    LOGI("Metadata pointer at 0x%" PRIx64 " = 0x%" PRIx64, ptr_addr, metadata_ptr);
-    
-    // Read and verify magic - use direct memory read since we're in the same process
-    uint32_t *magic_ptr = (uint32_t *)metadata_ptr;
-    uint32_t magic = *magic_ptr;
-    LOGI("Read magic: 0x%x", magic);
-    
-    if (magic != METADATA_MAGIC) {
-        LOGW("Invalid magic 0x%x at metadata pointer (expected 0x%x)", magic, METADATA_MAGIC);
-        return false;
-    }
-    
-    uint32_t version = *(uint32_t *)(metadata_ptr + 4);
-    LOGI("Found metadata at 0x%" PRIx64 ", magic=0x%x, version=%d", metadata_ptr, magic, version);
-    
-    // Read header to estimate size - scan for largest offset
-    size_t estimated_size = 0;
-    uint32_t *header = (uint32_t *)metadata_ptr;
-    
-    // Header contains offset/size pairs, find the largest offset + size
-    for (int i = 2; i < 60; i += 2) {
-        uint32_t offset = header[i];
-        uint32_t count = header[i + 1];
-        if (offset > 0 && offset < 100 * 1024 * 1024) {
-            size_t end = offset + count * 8; // rough estimate
-            if (end > estimated_size) estimated_size = end;
-        }
-    }
-    
-    // Fallback: try to read metadata size from header fields
-    if (estimated_size < 1024 * 1024) {
-        // Read stringLiteralDataOffset + stringLiteralDataSize
-        uint32_t str_off = header[2];  // offset 8
-        uint32_t str_size = header[3]; // offset 12
-        if (str_off > 0 && str_size > 0) {
-            estimated_size = str_off + str_size;
-        }
-    }
-    
-    // Default to 50MB if can't estimate
-    if (estimated_size < 1024 * 1024) {
-        estimated_size = 50 * 1024 * 1024;
-    }
-    
-    // Round up
-    estimated_size = (estimated_size + 0xFFF) & ~0xFFF;
-    LOGI("Estimated metadata size: %zu bytes", estimated_size);
-    
-    // Dump to file
-    auto metaPath = std::string(outDir).append("/files/global-metadata.dat");
-    FILE *outFile = fopen(metaPath.c_str(), "wb");
-    if (!outFile) {
-        LOGE("Failed to create %s", metaPath.c_str());
-        return false;
-    }
-    
-    // Write directly from memory - we're in the same process
-    fwrite((void *)metadata_ptr, 1, estimated_size, outFile);
-    fclose(outFile);
-    
-    LOGI("Metadata dumped to %s (%zu bytes)", metaPath.c_str(), estimated_size);
-    return true;
+    // ROK: export symbols are hash-obfuscated, CodeRegistration is runtime-constructed
+    // Direct pointer dump not available — fallback to memory scan
+    return false;
 }
 
 // Search for metadata in memory and dump it
@@ -611,10 +569,10 @@ static void dump_metadata(const char *outDir) {
                 uint32_t version = *(uint32_t *)(ptr + 4);
                 if (version >= 24 && version <= 31) {
                     LOGI("Found metadata at %p, version %d", ptr, version);
-                    
+
                     size_t max_size = region_end - ptr;
                     if (max_size > 100 * 1024 * 1024) max_size = 100 * 1024 * 1024;
-                    
+
                     auto metaPath = std::string(outDir).append("/files/global-metadata.dat");
                     FILE *outFile = fopen(metaPath.c_str(), "wb");
                     if (outFile) {
@@ -625,6 +583,22 @@ static void dump_metadata(const char *outDir) {
                     }
                     break;
                 }
+            }
+            // Also check for HTPX (NetHTProtect) — dump with HTPX header intact
+            if (magic == HTPX_MAGIC) {
+                LOGI("Found HTPX metadata at %p", ptr);
+                size_t max_size = region_end - ptr;
+                if (max_size > 100 * 1024 * 1024) max_size = 100 * 1024 * 1024;
+
+                auto metaPath = std::string(outDir).append("/files/global-metadata-htpx.dat");
+                FILE *outFile = fopen(metaPath.c_str(), "wb");
+                if (outFile) {
+                    fwrite(ptr, 1, max_size, outFile);
+                    fclose(outFile);
+                    LOGI("HTPX metadata dumped to %s (%zu bytes)", metaPath.c_str(), max_size);
+                    found = true;
+                }
+                break;
             }
             ptr += 4;
         }
