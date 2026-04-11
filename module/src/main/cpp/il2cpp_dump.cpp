@@ -447,6 +447,10 @@ void il2cpp_dump(const char *outDir) {
         for (int j = 0; j < classCount; ++j) {
             auto klass = const_cast<Il2CppClass *>(il2cpp_image_get_class(image, j));
             if (!klass) continue;
+            // Force initialize all method pointers for this class
+            if (il2cpp_class_init_all_method) {
+                il2cpp_class_init_all_method(klass);
+            }
             auto className = il2cpp_class_get_name(klass);
             auto nameSpace = il2cpp_class_get_namespace(klass);
             std::string fullName;
