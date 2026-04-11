@@ -12,6 +12,7 @@
 #include <string>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <dlfcn.h>
 #include <pthread.h>
 
