@@ -445,7 +445,7 @@ void il2cpp_dump(const char *outDir) {
         auto imageName = il2cpp_image_get_name(image);
         auto classCount = il2cpp_image_get_class_count(image);
         for (int j = 0; j < classCount; ++j) {
-            auto klass = il2cpp_image_get_class(image, j);
+            auto klass = const_cast<Il2CppClass *>(il2cpp_image_get_class(image, j));
             if (!klass) continue;
             auto className = il2cpp_class_get_name(klass);
             auto nameSpace = il2cpp_class_get_namespace(klass);
