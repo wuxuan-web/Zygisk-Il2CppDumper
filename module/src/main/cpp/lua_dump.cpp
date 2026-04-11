@@ -89,11 +89,13 @@ static void try_dump(lua_State *L, const char *name, size_t input_sz) {
         uintptr_t patch_addr = func_addr + 0x18; // CBZ instruction
         uintptr_t page = patch_addr & ~0xFFFUL;
         if (mprotect((void *)page, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
-            // Replace CBZ W9, +0x24 with NOP (0xD503201F)
-            uint32_t nop = 0xD503201F;
-            memcpy((void *)patch_addr, &nop, 4);
+            // Replace CBZ W9, +0x24 with unconditional B +0x24
+            // CBZ was at +0x18, target is +0x24, delta = 0xC bytes = 3 instructions
+            // B #3 = 0x14000003
+            uint32_t branch = 0x14000003;
+            memcpy((void *)patch_addr, &branch, 4);
             __builtin___clear_cache((char *)patch_addr, (char *)(patch_addr + 4));
-            LOGI("lua_dump: patched isC check at %p (NOP'd CBZ)", (void *)patch_addr);
+            LOGI("lua_dump: patched isC check at %p (B +0x24, skip error return)", (void *)patch_addr);
             patched = true;
         }
     }
