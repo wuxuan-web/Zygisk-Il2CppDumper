@@ -206,14 +206,47 @@ static int hooked_lua_loadfile(lua_State *L, const char *filename) {
     return orig_lua_loadfile(L, filename);
 }
 
-// Hooked luaL_loadbuffer: intercepts buffer loading (loadstring etc)
+// Hooked luaL_loadbuffer: intercepts buffer loading, saves the raw buffer
 static int hooked_luaL_loadbuffer(lua_State *L, const char *buff, size_t sz, const char *name) {
-    int result = orig_luaL_loadbuffer(L, buff, sz, name);
-    if (result == 0 && name && sz > 100) {
-        // Only dump larger buffers (skip tiny loadstring snippets)
-        try_dump(L, name, sz);
+    // Save the buffer content BEFORE loading (this is the encrypted .ls bytecode)
+    if (buff && sz > 100 && name && g_outDir[0]) {
+        g_dumpCount++;
+
+        char dir_path[768];
+        snprintf(dir_path, sizeof(dir_path), "%s/lua_dump", g_outDir);
+        mkdir(dir_path, 0777);
+
+        std::string safe = sanitize_name(name);
+        char out_path[1024];
+
+        // Save raw buffer (Lilith's custom encrypted format)
+        snprintf(out_path, sizeof(out_path), "%s/%s.ls", dir_path, safe.c_str());
+        FILE *f = fopen(out_path, "wb");
+        if (f) {
+            fwrite(buff, 1, sz, f);
+            fclose(f);
+        }
+
+        // Save XOR 0x63 decrypted copy
+        if (sz > 1 && (uint8_t)buff[0] == 0x1b) {
+            snprintf(out_path, sizeof(out_path), "%s/%s.luac", dir_path, safe.c_str());
+            f = fopen(out_path, "wb");
+            if (f) {
+                fwrite(buff, 1, 1, f); // byte 0 stays
+                for (size_t i = 1; i < sz; i++) {
+                    uint8_t b = (uint8_t)buff[i] ^ 0x63;
+                    fwrite(&b, 1, 1, f);
+                }
+                fclose(f);
+            }
+        }
+
+        if (g_dumpCount <= 20 || g_dumpCount % 200 == 0) {
+            LOGI("Lua buffer [%d]: %s (%zu bytes)", g_dumpCount, name, sz);
+        }
     }
-    return result;
+
+    return orig_luaL_loadbuffer(L, buff, sz, name);
 }
 
 // Install inline hook on a function
