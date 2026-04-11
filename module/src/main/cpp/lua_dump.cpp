@@ -81,7 +81,23 @@ static void try_dump(lua_State *L, const char *name, size_t input_sz) {
 
     int dump_result = -1;
 
-    // Try lua_dump first (higher level, standard API)
+    // Patch lua_dump's isC check at runtime: NOP the CBZ at offset +0x18
+    // so it always falls through to the dump path
+    static bool patched = false;
+    if (!patched && p_lua_dump) {
+        uintptr_t func_addr = (uintptr_t)p_lua_dump;
+        uintptr_t patch_addr = func_addr + 0x18; // CBZ instruction
+        uintptr_t page = patch_addr & ~0xFFFUL;
+        if (mprotect((void *)page, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
+            // Replace CBZ W9, +0x24 with NOP (0xD503201F)
+            uint32_t nop = 0xD503201F;
+            memcpy((void *)patch_addr, &nop, 4);
+            __builtin___clear_cache((char *)patch_addr, (char *)(patch_addr + 4));
+            LOGI("lua_dump: patched isC check at %p (NOP'd CBZ)", (void *)patch_addr);
+            patched = true;
+        }
+    }
+
     if (p_lua_dump) {
         dump_result = p_lua_dump(L, (void *)lua_writer, f);
     }
