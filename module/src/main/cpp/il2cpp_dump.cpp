@@ -434,6 +434,41 @@ void il2cpp_dump(const char *outDir) {
     }
     outStream.close();
     LOGI("dump done!");
+
+    // === NEW: dump method_rvas.txt with full name→RVA mapping ===
+    LOGI("dumping method RVAs...");
+    auto rvaPath = std::string(outDir).append("/files/method_rvas.txt");
+    std::ofstream rvaStream(rvaPath);
+    int totalRvas = 0;
+    for (int i = 0; i < size; ++i) {
+        auto image = il2cpp_assembly_get_image(assemblies[i]);
+        auto imageName = il2cpp_image_get_name(image);
+        auto classCount = il2cpp_image_get_class_count(image);
+        for (int j = 0; j < classCount; ++j) {
+            auto klass = il2cpp_image_get_class(image, j);
+            if (!klass) continue;
+            auto className = il2cpp_class_get_name(klass);
+            auto nameSpace = il2cpp_class_get_namespace(klass);
+            std::string fullName;
+            if (nameSpace && strlen(nameSpace) > 0) {
+                fullName = std::string(nameSpace) + "." + className;
+            } else {
+                fullName = className;
+            }
+            void *iter = nullptr;
+            while (auto method = il2cpp_class_get_methods(klass, &iter)) {
+                if (method->methodPointer) {
+                    auto rva = (uint64_t)method->methodPointer - il2cpp_base;
+                    auto methodName = il2cpp_method_get_name(method);
+                    rvaStream << imageName << "|" << fullName << "|"
+                              << methodName << "|0x" << std::hex << rva << "\n";
+                    totalRvas++;
+                }
+            }
+        }
+    }
+    rvaStream.close();
+    LOGI("method_rvas.txt done! %d methods with RVA", totalRvas);
     
     // Dump decrypted metadata from memory
     // Wait a bit for metadata to be fully initialized
