@@ -81,22 +81,38 @@ static void try_dump(lua_State *L, const char *name, size_t input_sz) {
 
     int dump_result = -1;
 
-    // Patch lua_dump's isC check at runtime: NOP the CBZ at offset +0x18
-    // so it always falls through to the dump path
+    // Patch lua_dump to skip ALL checks and go straight to dump logic:
+    // Original layout:
+    //   +00: LDR X8, [X0, #0x10]     ; L->top
+    //   +04: LDUR W9, [X8, #-8]      ; type tag
+    //   +08: CMP W9, #6              ; check function type
+    //   +0C: B.NE +1C (error)        ; skip if not function
+    //   +10: LDUR X8, [X8, #-0x10]   ; gc pointer
+    //   +14: LDRB W9, [X8, #0x18]    ; isC check
+    //   +18: CBZ W9, +24 (ok)        ; branch to dump
+    //   +1C: MOV W0, #1; RET         ; error return
+    //   +24: (dump logic starts)
+    //
+    // Patch +0C: replace B.NE with NOP (skip type check)
+    // Patch +18: replace CBZ with B +24 (unconditional jump to dump)
     static bool patched = false;
     if (!patched && p_lua_dump) {
         uintptr_t func_addr = (uintptr_t)p_lua_dump;
-        uintptr_t patch_addr = func_addr + 0x18; // CBZ instruction
-        uintptr_t page = patch_addr & ~0xFFFUL;
+        uintptr_t page = func_addr & ~0xFFFUL;
         if (mprotect((void *)page, 0x2000, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
-            // Replace CBZ W9, +0x24 with unconditional B +0x24
-            // CBZ was at +0x18, target is +0x24, delta = 0xC bytes = 3 instructions
-            // B #3 = 0x14000003
-            uint32_t branch = 0x14000003;
-            memcpy((void *)patch_addr, &branch, 4);
-            __builtin___clear_cache((char *)patch_addr, (char *)(patch_addr + 4));
-            LOGI("lua_dump: patched isC check at %p (B +0x24, skip error return)", (void *)patch_addr);
+            uint32_t nop = 0xD503201F;
+            uint32_t branch = 0x14000003; // B +3 instructions (skip MOV+RET)
+
+            // NOP the B.NE at +0C (skip type==6 check)
+            memcpy((void *)(func_addr + 0x0C), &nop, 4);
+            // Replace CBZ at +18 with unconditional B +24
+            memcpy((void *)(func_addr + 0x18), &branch, 4);
+
+            __builtin___clear_cache((char *)func_addr, (char *)(func_addr + 0x20));
+            LOGI("lua_dump: patched +0C (NOP B.NE) and +18 (B +24) at %p", (void *)func_addr);
             patched = true;
+        } else {
+            LOGE("lua_dump: mprotect failed for lua_dump at %p", (void *)func_addr);
         }
     }
 
@@ -119,18 +135,75 @@ static void try_dump(lua_State *L, const char *name, size_t input_sz) {
     }
 }
 
-// Hooked lua_loadfile: intercepts file loading
+// Copy a file from game data to our dump directory
+static void copy_lua_file(const char *filename) {
+    if (!filename || !g_outDir[0]) return;
+
+    // Open source file
+    FILE *src = fopen(filename, "rb");
+    if (!src) return;
+
+    fseek(src, 0, SEEK_END);
+    long sz = ftell(src);
+    fseek(src, 0, SEEK_SET);
+
+    if (sz <= 0 || sz > 50 * 1024 * 1024) {
+        fclose(src);
+        return;
+    }
+
+    // Read file content
+    uint8_t *buf = (uint8_t *)malloc(sz);
+    if (!buf) { fclose(src); return; }
+    fread(buf, 1, sz, src);
+    fclose(src);
+
+    // Create output directory
+    char dir_path[768];
+    snprintf(dir_path, sizeof(dir_path), "%s/lua_dump", g_outDir);
+    mkdir(dir_path, 0777);
+
+    // Sanitize filename
+    std::string safe = sanitize_name(filename);
+
+    // Save raw copy (encrypted)
+    char out_path[1024];
+    snprintf(out_path, sizeof(out_path), "%s/%s.ls", dir_path, safe.c_str());
+    FILE *dst = fopen(out_path, "wb");
+    if (dst) {
+        fwrite(buf, 1, sz, dst);
+        fclose(dst);
+    }
+
+    // Also save XOR 0x63 decrypted copy
+    snprintf(out_path, sizeof(out_path), "%s/%s.luac", dir_path, safe.c_str());
+    dst = fopen(out_path, "wb");
+    if (dst) {
+        // Byte 0 stays, rest XOR 0x63
+        fwrite(buf, 1, 1, dst);
+        for (long i = 1; i < sz; i++) {
+            uint8_t b = buf[i] ^ 0x63;
+            fwrite(&b, 1, 1, dst);
+        }
+        fclose(dst);
+    }
+
+    free(buf);
+}
+
+// Hooked lua_loadfile: intercepts file loading, copies the file
 static int hooked_lua_loadfile(lua_State *L, const char *filename) {
-    int result = orig_lua_loadfile(L, filename);
-    if (result == 0 && filename) {
+    // Copy the file BEFORE loading (in case loading modifies state)
+    if (filename) {
         g_fileCount++;
-        try_dump(L, filename, 0);
+        copy_lua_file(filename);
 
         if (g_fileCount <= 20 || g_fileCount % 100 == 0) {
-            LOGI("Lua file [%d]: %s (load result=%d)", g_fileCount, filename, result);
+            LOGI("Lua file [%d]: %s", g_fileCount, filename);
         }
     }
-    return result;
+
+    return orig_lua_loadfile(L, filename);
 }
 
 // Hooked luaL_loadbuffer: intercepts buffer loading (loadstring etc)
