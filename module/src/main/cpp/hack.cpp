@@ -4,6 +4,7 @@
 
 #include "hack.h"
 #include "il2cpp_dump.h"
+#include "lua_dump.h"
 #include "log.h"
 #include "xdl.h"
 #include <cstring>
@@ -25,6 +26,8 @@ void hack_start(const char *game_data_dir) {
             load = true;
             il2cpp_api_init(handle);
             il2cpp_dump(game_data_dir);
+            // Start Lua bytecode dump hook after il2cpp is done
+            lua_dump_start(game_data_dir);
             break;
         } else {
             sleep(1);
