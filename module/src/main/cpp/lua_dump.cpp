@@ -437,6 +437,7 @@ static bool install_hooks() {
     p_lua_getfield = (decltype(p_lua_getfield))xdl_sym(engine, "lua_getfield", nullptr);
     p_lua_pushvalue = (decltype(p_lua_pushvalue))xdl_sym(engine, "lua_pushvalue", nullptr);
     p_lua_tolstring = (decltype(p_lua_tolstring))xdl_sym(engine, "lua_tolstring", nullptr);
+    p_lua_pcall = (decltype(p_lua_pcall))xdl_sym(engine, "lua_pcall", nullptr);
 
     LOGI("lua_dump: getfield=%p pushvalue=%p tolstring=%p pcall=%p",
          p_lua_getfield, p_lua_pushvalue, p_lua_tolstring, p_lua_pcall);
