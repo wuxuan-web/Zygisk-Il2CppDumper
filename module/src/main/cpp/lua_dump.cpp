@@ -249,20 +249,23 @@ static void do_bulk_dump(lua_State *L) {
         LOGE("lua_dump: cannot create script file %s", script_path);
         return;
     }
-    // Minimal diagnostic: test if string.dump exists and works on print
+    // Lilith's Lua parser rejects: 'function', '..' (concat operator)
+    // Use table.concat and string.format instead of ..
+    // Use no function definitions
     fprintf(sf, "local dir = '%s/'\n", dir_path);
-    fprintf(sf, "local log = io.open(dir .. '_log.txt', 'w')\n");
+    fprintf(sf, "local tc = table.concat\n");
+    fprintf(sf, "local sf = string.format\n");
+    fprintf(sf, "local log = io.open(tc({dir, '_log.txt'}), 'w')\n");
     fprintf(sf, "local sd = string['dump']\n");
-    fprintf(sf, "log:write('sd_type=' .. type(sd) .. '\\n')\n");
+    fprintf(sf, "log:write(sf('sd_type=%%s\\n', type(sd)))\n");
     fprintf(sf, "local ok, bc = pcall(sd, print)\n");
-    fprintf(sf, "log:write('ok=' .. tostring(ok) .. '\\n')\n");
-    fprintf(sf, "log:write('bc_type=' .. type(bc) .. '\\n')\n");
+    fprintf(sf, "log:write(sf('ok=%%s bc_type=%%s\\n', tostring(ok), type(bc)))\n");
     fprintf(sf, "if ok and type(bc) == 'string' then\n");
-    fprintf(sf, "  log:write('bc_len=' .. tostring(#bc) .. '\\n')\n");
-    fprintf(sf, "  local fh = io.open(dir .. 'print.luac', 'wb')\n");
+    fprintf(sf, "  log:write(sf('bc_len=%%d\\n', #bc))\n");
+    fprintf(sf, "  local fh = io.open(tc({dir, 'print.luac'}), 'wb')\n");
     fprintf(sf, "  if fh then fh:write(bc); fh:close() end\n");
     fprintf(sf, "else\n");
-    fprintf(sf, "  log:write('err=' .. tostring(bc) .. '\\n')\n");
+    fprintf(sf, "  log:write(sf('err=%%s\\n', tostring(bc)))\n");
     fprintf(sf, "end\n");
     fprintf(sf, "log:close()\n");
     fprintf(sf, "return 1\n");
