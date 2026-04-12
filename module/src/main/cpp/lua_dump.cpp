@@ -230,11 +230,8 @@ static void do_bulk_dump(lua_State *L) {
     if (g_bulk_dump_done) return;
     g_bulk_dump_done = true;
 
-    auto p_luaL_loadstring = (int (*)(lua_State *, const char *))
-        xdl_sym(xdl_open("libEngineDll.so", 0), "luaL_loadstring", nullptr);
-
-    if (!p_luaL_loadstring || !p_lua_pcall) {
-        LOGE("lua_dump: missing luaL_loadstring or pcall for bulk dump");
+    if (!p_lua_pcall || !orig_lua_loadfile) {
+        LOGE("lua_dump: missing pcall or lua_loadfile for bulk dump");
         return;
     }
 
@@ -243,13 +240,20 @@ static void do_bulk_dump(lua_State *L) {
     snprintf(dir_path, sizeof(dir_path), "%s/lua_dump", g_outDir);
     mkdir(dir_path, 0777);
 
-    // Lua script that iterates package.loaded and dumps each function
-    char lua_script[2048];
-    snprintf(lua_script, sizeof(lua_script),
-        "local dir = '%s/'\n"
+    // Write Lua script to file, then load it (avoids snprintf format issues)
+    char script_path[1024];
+    snprintf(script_path, sizeof(script_path), "%s/lua_dump/_dump_script.lua", g_outDir);
+
+    FILE *sf = fopen(script_path, "w");
+    if (!sf) {
+        LOGE("lua_dump: cannot create script file %s", script_path);
+        return;
+    }
+    fprintf(sf, "local dir = '%s/'\n", dir_path);
+    fprintf(sf,
         "local count = 0\n"
-        "local function try_dump(name, func)\n"
-        "  local ok, bc = pcall(string.dump, func)\n"
+        "local function try_dump(name, fn)\n"
+        "  local ok, bc = pcall(string.dump, fn)\n"
         "  if ok and bc then\n"
         "    local safe = name:gsub('[^%%w_.]', '_')\n"
         "    local f = io.open(dir .. safe .. '.luac', 'wb')\n"
@@ -258,30 +262,34 @@ static void do_bulk_dump(lua_State *L) {
         "end\n"
         "for modname, mod in pairs(package.loaded) do\n"
         "  if type(mod) == 'table' then\n"
-        "    for fname, func in pairs(mod) do\n"
-        "      if type(func) == 'function' then\n"
-        "        try_dump(tostring(modname)..'.'..tostring(fname), func)\n"
+        "    for fname, fn in pairs(mod) do\n"
+        "      if type(fn) == 'function' then\n"
+        "        try_dump(tostring(modname) .. '.' .. tostring(fname), fn)\n"
         "      end\n"
         "    end\n"
         "  elseif type(mod) == 'function' then\n"
-        "    try_dump('mod_'..tostring(modname), mod)\n"
+        "    try_dump('mod_' .. tostring(modname), mod)\n"
         "  end\n"
         "end\n"
         "for name, val in pairs(_G) do\n"
-        "  if type(val) == 'function' then try_dump('_G.'..tostring(name), val)\n"
+        "  if type(val) == 'function' then\n"
+        "    try_dump('_G.' .. tostring(name), val)\n"
         "  elseif type(val) == 'table' and name ~= '_G' and name ~= 'package' then\n"
         "    for k, v in pairs(val) do\n"
-        "      if type(v) == 'function' then try_dump(tostring(name)..'.'..tostring(k), v) end\n"
+        "      if type(v) == 'function' then\n"
+        "        try_dump(tostring(name) .. '.' .. tostring(k), v)\n"
+        "      end\n"
         "    end\n"
         "  end\n"
         "end\n"
-        "local f = io.open(dir .. '_manifest.txt', 'w')\n"
-        "if f then f:write(tostring(count)..'\\n'); f:close() end\n"
-        "return count\n",
-        dir_path);
+        "local mf = io.open(dir .. '_manifest.txt', 'w')\n"
+        "if mf then mf:write(tostring(count) .. '\\n'); mf:close() end\n"
+        "return count\n"
+    );
+    fclose(sf);
 
-    LOGI("lua_dump: executing bulk dump script...");
-    int load_result = p_luaL_loadstring(L, lua_script);
+    LOGI("lua_dump: executing bulk dump script from %s...", script_path);
+    int load_result = orig_lua_loadfile(L, script_path);
     if (load_result != 0) {
         const char *err = p_lua_tolstring(L, -1, NULL);
         LOGE("lua_dump: load script failed: %s", err ? err : "?");
