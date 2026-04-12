@@ -230,8 +230,23 @@ static void do_bulk_dump(lua_State *L) {
     if (g_bulk_dump_done) return;
     g_bulk_dump_done = true;
 
-    if (!p_lua_pcall || !orig_lua_loadfile) {
-        LOGE("lua_dump: missing pcall or lua_loadfile for bulk dump");
+    if (!p_lua_pcall || !p_lua_getfield || !p_lua_pushvalue ||
+        !p_lua_settop || !p_lua_gettop || !p_lua_tolstring) {
+        LOGE("lua_dump: missing Lua API functions for bulk dump");
+        return;
+    }
+
+    // Resolve additional APIs we need
+    void *engine = xdl_open("libEngineDll.so", 0);
+    auto p_lua_next = (int (*)(lua_State *, int))xdl_sym(engine, "lua_next", nullptr);
+    auto p_lua_pushnil = (void (*)(lua_State *))xdl_sym(engine, "lua_pushnil", nullptr);
+    auto p_lua_isfunction = (int (*)(lua_State *, int))xdl_sym(engine, "lua_isfunction", nullptr);
+    auto p_lua_istable = (int (*)(lua_State *, int))xdl_sym(engine, "lua_istable", nullptr);
+    auto p_lua_isstring = (int (*)(lua_State *, int))xdl_sym(engine, "lua_isstring", nullptr);
+    auto p_lua_pop = p_lua_settop; // lua_pop(L,n) = lua_settop(L, -(n)-1)
+
+    if (!p_lua_next || !p_lua_pushnil || !p_lua_isfunction) {
+        LOGE("lua_dump: missing lua_next/pushnil/isfunction");
         return;
     }
 
@@ -240,51 +255,107 @@ static void do_bulk_dump(lua_State *L) {
     snprintf(dir_path, sizeof(dir_path), "%s/lua_dump", g_outDir);
     mkdir(dir_path, 0777);
 
-    // Write Lua script to file, then load it (avoids snprintf format issues)
-    char script_path[1024];
-    snprintf(script_path, sizeof(script_path), "%s/lua_dump/_dump_script.lua", g_outDir);
+    LOGI("lua_dump: starting C API bulk dump...");
 
-    FILE *sf = fopen(script_path, "w");
-    if (!sf) {
-        LOGE("lua_dump: cannot create script file %s", script_path);
+    // Get string.dump function
+    // lua_getglobal(L, "string") → lua_getfield(L, -1, "dump")
+    int base_top = p_lua_gettop(L);
+    lua_getglobal(L, "string");        // [string_table]
+    p_lua_getfield(L, -1, "dump");     // [string_table, string.dump]
+    int sd_idx = p_lua_gettop(L);      // index of string.dump
+
+    int has_sd = p_lua_isfunction(L, sd_idx);
+    LOGI("lua_dump: string.dump is function: %d", has_sd);
+
+    // Write log
+    char log_path[1024];
+    snprintf(log_path, sizeof(log_path), "%s/_log.txt", dir_path);
+    FILE *logf = fopen(log_path, "w");
+
+    if (!has_sd) {
+        if (logf) { fprintf(logf, "string.dump NOT FOUND\n"); fclose(logf); }
+        p_lua_settop(L, base_top);
         return;
     }
-    // Lilith's Lua parser rejects: 'function', '..', 'if'
-    // Use only: local, for, pcall, table ops, io, string.format, and/or short-circuit
-    fprintf(sf, "local dir = '%s/'\n", dir_path);
-    fprintf(sf, "local tc = table.concat\n");
-    fprintf(sf, "local log = io.open(tc({dir, '_log.txt'}), 'w')\n");
-    fprintf(sf, "local sd = string['dump']\n");
-    fprintf(sf, "log:write(tc({'sd_type=', type(sd), '\\n'}))\n");
-    fprintf(sf, "local ok, bc = pcall(sd, print)\n");
-    fprintf(sf, "log:write(tc({'ok=', tostring(ok), ' bc_type=', type(bc), '\\n'}))\n");
-    fprintf(sf, "ok = ok and type(bc) == 'string'\n");
-    fprintf(sf, "local fh = ok and io.open(tc({dir, 'print.luac'}), 'wb')\n");
-    fprintf(sf, "local dummy = fh and fh:write(bc)\n");
-    fprintf(sf, "dummy = fh and fh:close()\n");
-    fprintf(sf, "log:close()\n");
-    fprintf(sf, "return 1\n");
-    fclose(sf);
 
-    // Read script back, XOR-encrypt it so luaL_loadbuffer's decrypt produces correct source
-    // luaL_loadbuffer triggers xor_v1: key = buf[0] ^ 0x78, XOR from byte 1 in 16-byte blocks
-    // We need to PRE-ENCRYPT the script so that after xor_v1 decrypt it becomes valid Lua source
-    sf = fopen(script_path, "rb");
-    if (!sf) {
-        LOGE("lua_dump: cannot re-read script %s", script_path);
-        return;
+    // Iterate package.loaded
+    lua_getglobal(L, "package");       // [string_table, sd, package]
+    p_lua_getfield(L, -1, "loaded");   // [string_table, sd, package, loaded]
+    int loaded_idx = p_lua_gettop(L);
+
+    int total = 0, ok_count = 0, fail_count = 0;
+    char out_path[1024];
+
+    // lua_pushnil + lua_next loop over package.loaded
+    p_lua_pushnil(L);                  // [... loaded, nil]
+    while (p_lua_next(L, loaded_idx)) {
+        // stack: [... loaded, key, value]
+        if (p_lua_istable(L, -1)) {
+            // Iterate the module table
+            int mod_idx = p_lua_gettop(L);
+            const char *modname = p_lua_tolstring(L, -2, nullptr); // key = module name
+
+            p_lua_pushnil(L);
+            while (p_lua_next(L, mod_idx)) {
+                // stack: [... mod, fname_key, fn_value]
+                if (p_lua_isfunction(L, -1)) {
+                    total++;
+                    const char *fname = p_lua_tolstring(L, -2, nullptr);
+
+                    // Try string.dump: push sd, push fn, pcall(1,1,0)
+                    p_lua_pushvalue(L, sd_idx);  // push string.dump
+                    p_lua_pushvalue(L, -2);      // push the function
+                    int pcr = p_lua_pcall(L, 1, 1, 0); // call sd(fn)
+
+                    if (pcr == 0 && p_lua_isstring(L, -1)) {
+                        size_t bc_len = 0;
+                        const char *bc = p_lua_tolstring(L, -1, &bc_len);
+                        if (bc && bc_len > 4) {
+                            ok_count++;
+                            // Save first 5 + every 1000th
+                            if (ok_count <= 5 || ok_count % 1000 == 0) {
+                                // Build filename
+                                snprintf(out_path, sizeof(out_path), "%s/%s__%s.luac",
+                                         dir_path, modname ? modname : "?", fname ? fname : "?");
+                                // Sanitize
+                                for (char *p = out_path + strlen(dir_path) + 1; *p; p++) {
+                                    if (*p == '/' || *p == '<' || *p == '>' || *p == ':') *p = '_';
+                                }
+                                FILE *fh = fopen(out_path, "wb");
+                                if (fh) { fwrite(bc, 1, bc_len, fh); fclose(fh); }
+                            }
+                            if (logf && ok_count <= 5) {
+                                fprintf(logf, "OK[%d]: %s.%s (%zu bytes)\n",
+                                        ok_count, modname ? modname : "?", fname ? fname : "?", bc_len);
+                            }
+                        }
+                    } else {
+                        fail_count++;
+                        if (logf && fail_count <= 3) {
+                            const char *err = p_lua_tolstring(L, -1, nullptr);
+                            fprintf(logf, "FAIL: %s.%s err=%s\n",
+                                    modname ? modname : "?", fname ? fname : "?", err ? err : "?");
+                        }
+                    }
+                    p_lua_settop(L, mod_idx + 1); // pop pcall result, keep key for next
+                }
+                p_lua_settop(L, mod_idx + 1); // pop value, keep key for lua_next
+            }
+        }
+        p_lua_settop(L, loaded_idx + 1); // pop value, keep key for lua_next
     }
-    fseek(sf, 0, SEEK_END);
-    long script_len = ftell(sf);
-    fseek(sf, 0, SEEK_SET);
-    char *script_buf = (char *)malloc(script_len + 1);
-    fread(script_buf, 1, script_len, sf);
-    script_buf[script_len] = 0;
-    fclose(sf);
 
-    LOGI("lua_dump: executing bulk dump script (%ld bytes)...", script_len);
-    int load_result = orig_luaL_loadbuffer(L, script_buf, script_len, "=dump_script");
-    free(script_buf);
+    if (logf) {
+        fprintf(logf, "DONE: total=%d ok=%d fail=%d\n", total, ok_count, fail_count);
+        fclose(logf);
+    }
+
+    // Restore stack
+    p_lua_settop(L, base_top);
+    LOGI("lua_dump: C API bulk dump complete: total=%d ok=%d fail=%d", total, ok_count, fail_count);
+
+    // No need to load/run a script
+    int load_result = 0;
     if (load_result != 0) {
         const char *err = p_lua_tolstring(L, -1, NULL);
         LOGE("lua_dump: load script failed: %s", err ? err : "?");
