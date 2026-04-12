@@ -240,13 +240,15 @@ static void do_bulk_dump(lua_State *L) {
     void *engine = xdl_open("libEngineDll.so", 0);
     auto p_lua_next = (int (*)(lua_State *, int))xdl_sym(engine, "lua_next", nullptr);
     auto p_lua_pushnil = (void (*)(lua_State *))xdl_sym(engine, "lua_pushnil", nullptr);
-    auto p_lua_isfunction = (int (*)(lua_State *, int))xdl_sym(engine, "lua_isfunction", nullptr);
-    auto p_lua_istable = (int (*)(lua_State *, int))xdl_sym(engine, "lua_istable", nullptr);
-    auto p_lua_isstring = (int (*)(lua_State *, int))xdl_sym(engine, "lua_isstring", nullptr);
-    auto p_lua_pop = p_lua_settop; // lua_pop(L,n) = lua_settop(L, -(n)-1)
+    auto p_lua_isstring_fn = (int (*)(lua_State *, int))xdl_sym(engine, "lua_isstring", nullptr);
 
-    if (!p_lua_next || !p_lua_pushnil || !p_lua_isfunction) {
-        LOGE("lua_dump: missing lua_next/pushnil/isfunction");
+    // lua_isfunction/lua_istable are macros in Lua 5.1, use lua_type instead
+    // LUA_TFUNCTION=6, LUA_TTABLE=5, LUA_TSTRING=4
+    #define LUA_TFUNCTION 6
+    #define LUA_TTABLE 5
+
+    if (!p_lua_next || !p_lua_pushnil || !p_lua_type) {
+        LOGE("lua_dump: missing lua_next=%p pushnil=%p type=%p", p_lua_next, p_lua_pushnil, p_lua_type);
         return;
     }
 
@@ -264,7 +266,7 @@ static void do_bulk_dump(lua_State *L) {
     p_lua_getfield(L, -1, "dump");     // [string_table, string.dump]
     int sd_idx = p_lua_gettop(L);      // index of string.dump
 
-    int has_sd = p_lua_isfunction(L, sd_idx);
+    int has_sd = (p_lua_type(L, sd_idx) == LUA_TFUNCTION);
     LOGI("lua_dump: string.dump is function: %d", has_sd);
 
     // Write log
@@ -290,7 +292,7 @@ static void do_bulk_dump(lua_State *L) {
     p_lua_pushnil(L);                  // [... loaded, nil]
     while (p_lua_next(L, loaded_idx)) {
         // stack: [... loaded, key, value]
-        if (p_lua_istable(L, -1)) {
+        if (p_lua_type(L, -1) == LUA_TTABLE) {
             // Iterate the module table
             int mod_idx = p_lua_gettop(L);
             const char *modname = p_lua_tolstring(L, -2, nullptr); // key = module name
@@ -298,7 +300,7 @@ static void do_bulk_dump(lua_State *L) {
             p_lua_pushnil(L);
             while (p_lua_next(L, mod_idx)) {
                 // stack: [... mod, fname_key, fn_value]
-                if (p_lua_isfunction(L, -1)) {
+                if ((p_lua_type(L, -1) == LUA_TFUNCTION)) {
                     total++;
                     const char *fname = p_lua_tolstring(L, -2, nullptr);
 
@@ -307,7 +309,7 @@ static void do_bulk_dump(lua_State *L) {
                     p_lua_pushvalue(L, -2);      // push the function
                     int pcr = p_lua_pcall(L, 1, 1, 0); // call sd(fn)
 
-                    if (pcr == 0 && p_lua_isstring(L, -1)) {
+                    if (pcr == 0 && (p_lua_type(L, -1) == 4)) {
                         size_t bc_len = 0;
                         const char *bc = p_lua_tolstring(L, -1, &bc_len);
                         if (bc && bc_len > 4) {
