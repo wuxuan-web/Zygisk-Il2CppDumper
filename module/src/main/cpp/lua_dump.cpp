@@ -32,6 +32,14 @@ static int (*p_lua_dump)(lua_State *L, void *writer, void *data) = nullptr;
 static int (*p_lua_gettop)(lua_State *L) = nullptr;
 static void (*p_lua_settop)(lua_State *L, int index) = nullptr;
 static int (*p_lua_type)(lua_State *L, int index) = nullptr;
+static void (*p_lua_getfield)(lua_State *L, int index, const char *k) = nullptr;
+static void (*p_lua_pushvalue)(lua_State *L, int index) = nullptr;
+static const char *(*p_lua_tolstring)(lua_State *L, int index, size_t *len) = nullptr;
+
+#define LUA_GLOBALSINDEX (-10002)
+static void lua_getglobal(lua_State *L, const char *name) {
+    p_lua_getfield(L, LUA_GLOBALSINDEX, name);
+}
 
 static char g_outDir[512] = {0};
 static int g_dumpCount = 0;
@@ -191,19 +199,101 @@ static void copy_lua_file(const char *filename) {
     free(buf);
 }
 
-// Hooked lua_loadfile: intercepts file loading, copies the file
+// Use Lua-level string.dump to serialize the loaded function
+static void lua_level_dump(lua_State *L, const char *filename) {
+    if (!p_lua_gettop || !g_outDir[0]) return;
+
+    // Stack: [..., loaded_function]
+    // We'll call: local ok, bc = pcall(string.dump, func)
+
+    // Get string.dump function
+    // lua_getglobal(L, "string") → lua_getfield(L, -1, "dump") → push func → pcall
+
+    // Simpler: use luaL_dostring to execute dump code
+    // But we need luaL_dostring... let's use loadbuffer + pcall
+
+    // Actually simplest: just try calling lua_dump directly with our patched version
+    // But lua_dump was blocked. Let's try a different path:
+    // Use luaL_loadstring to compile "return string.dump(...)" and call it
+
+    // For now, just save the raw file bytes (pre-decryption) -
+    // we'll decode offline with the correct algorithm
+    // This is actually what we need: the RAW .ls bytes before the VM touches them
+}
+
+// Hooked lua_loadfile: intercepts file loading
+// Strategy: after successful load, use pcall(string.dump, func) to get standard bytecode
 static int hooked_lua_loadfile(lua_State *L, const char *filename) {
-    // Copy the file BEFORE loading (in case loading modifies state)
-    if (filename) {
+    int result = orig_lua_loadfile(L, filename);
+
+    if (result == 0 && filename && g_outDir[0]) {
         g_fileCount++;
-        copy_lua_file(filename);
+
+        // The loaded function is on top of stack.
+        // Try: push string.dump, push copy of function, pcall
+        // string library should be loaded by now
+
+        // lua_getglobal(L, "string")
+        // lua_getfield(L, -1, "dump")
+        // lua_pushvalue(L, -3)  -- copy the loaded function
+        // lua_pcall(L, 1, 1, 0) -- call string.dump(func)
+        // result is the bytecode string on stack
+
+        // We need lua_getglobal, lua_getfield, lua_pushvalue, lua_isstring, lua_tolstring
+
+        if (p_lua_getfield && p_lua_pushvalue &&
+            p_lua_tolstring && p_lua_pcall && p_lua_settop && p_lua_gettop) {
+
+            int top = p_lua_gettop(L);
+
+            // Stack: [... func]
+            lua_getglobal(L, "string");       // [... func, string_table]
+            p_lua_getfield(L, -1, "dump");    // [... func, string_table, string.dump]
+            p_lua_pushvalue(L, top);           // [... func, string_table, string.dump, func_copy]
+
+            int pcall_result = p_lua_pcall(L, 1, 1, 0);  // [... func, string_table, bytecode_or_err]
+
+            if (pcall_result == 0) {
+                size_t bc_len = 0;
+                const char *bc = p_lua_tolstring(L, -1, &bc_len);
+
+                if (bc && bc_len > 4) {
+                    // Save the standard bytecode!
+                    char dir_path[768];
+                    snprintf(dir_path, sizeof(dir_path), "%s/lua_dump", g_outDir);
+                    mkdir(dir_path, 0777);
+
+                    std::string safe = sanitize_name(filename);
+                    char out_path[1024];
+                    snprintf(out_path, sizeof(out_path), "%s/%s.luac", dir_path, safe.c_str());
+
+                    FILE *f = fopen(out_path, "wb");
+                    if (f) {
+                        fwrite(bc, 1, bc_len, f);
+                        fclose(f);
+                    }
+
+                    if (g_fileCount <= 30 || g_fileCount % 200 == 0) {
+                        LOGI("Lua string.dump OK [%d]: %s → %zu bytes", g_fileCount, filename, bc_len);
+                    }
+                }
+            } else {
+                if (g_fileCount <= 10) {
+                    const char *err = p_lua_tolstring(L, -1, NULL);
+                    LOGI("Lua string.dump FAIL [%d]: %s → %s", g_fileCount, filename, err ? err : "?");
+                }
+            }
+
+            // Restore stack: pop string_table and result, keep original func
+            p_lua_settop(L, top);
+        }
 
         if (g_fileCount <= 20 || g_fileCount % 100 == 0) {
             LOGI("Lua file [%d]: %s", g_fileCount, filename);
         }
     }
 
-    return orig_lua_loadfile(L, filename);
+    return result;
 }
 
 // Hooked luaL_loadbuffer: intercepts buffer loading, saves the raw buffer
@@ -343,6 +433,12 @@ static bool install_hooks() {
     p_lua_gettop = (decltype(p_lua_gettop))xdl_sym(engine, "lua_gettop", nullptr);
     p_lua_settop = (decltype(p_lua_settop))xdl_sym(engine, "lua_settop", nullptr);
     p_lua_type = (decltype(p_lua_type))xdl_sym(engine, "lua_type", nullptr);
+    p_lua_getfield = (decltype(p_lua_getfield))xdl_sym(engine, "lua_getfield", nullptr);
+    p_lua_pushvalue = (decltype(p_lua_pushvalue))xdl_sym(engine, "lua_pushvalue", nullptr);
+    p_lua_tolstring = (decltype(p_lua_tolstring))xdl_sym(engine, "lua_tolstring", nullptr);
+
+    LOGI("lua_dump: getfield=%p pushvalue=%p tolstring=%p pcall=%p",
+         p_lua_getfield, p_lua_pushvalue, p_lua_tolstring, p_lua_pcall);
 
     LOGI("lua_dump: lua_loadfile=%p luaL_loadbuffer=%p lua_dump=%p luaU_dump=%p",
          p_lua_loadfile, p_luaL_loadbuffer_addr, p_lua_dump, p_luaU_dump);
