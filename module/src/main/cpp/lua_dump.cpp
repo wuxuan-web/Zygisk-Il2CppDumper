@@ -399,8 +399,18 @@ static int hooked_lua_loadfile(lua_State *L, const char *filename) {
     return result;
 }
 
-// Hooked luaL_loadbuffer: count calls, trigger bulk dump after delay
+static bool g_ready_to_dump = false;
+
+// Hooked luaL_loadbuffer: count calls, trigger bulk dump
 static int hooked_luaL_loadbuffer(lua_State *L, const char *buff, size_t sz, const char *name) {
+    // BEFORE calling original: check if we should dump
+    // At this point Lua state is idle (not mid-compilation)
+    if (g_ready_to_dump && !g_bulk_dump_done) {
+        g_bulk_dump_done = true;
+        LOGI("lua_dump: executing bulk dump BEFORE loadbuffer (state is idle)...");
+        do_bulk_dump(L);
+    }
+
     int result = orig_luaL_loadbuffer(L, buff, sz, name);
 
     g_dumpCount++;
@@ -410,15 +420,10 @@ static int hooked_luaL_loadbuffer(lua_State *L, const char *buff, size_t sz, con
         LOGI("Lua buffer [%d]: %s (%zu bytes)", g_dumpCount, name ? name : "?", sz);
     }
 
-    // Wait until loadbuffer count reaches 50 (game fully loaded)
-    // Then do dump ON THIS THREAD (safe because we're in the Lua calling context)
-    if (g_dumpCount >= 25 && !g_bulk_dump_done) {
-        g_bulk_dump_done = true;
-        // We're inside luaL_loadbuffer call, Lua state is valid
-        // Do the dump AFTER the current loadbuffer returns
-        // Actually, we can do it right here before returning - the state is consistent
-        LOGI("lua_dump: 50 loadbuffer calls, doing bulk dump on this thread...");
-        do_bulk_dump(L);
+    // After 25 calls, set flag for NEXT call to trigger dump
+    if (g_dumpCount >= 25 && !g_ready_to_dump && !g_bulk_dump_done) {
+        g_ready_to_dump = true;
+        LOGI("lua_dump: armed, will dump on next loadbuffer call");
     }
 
     return result;
