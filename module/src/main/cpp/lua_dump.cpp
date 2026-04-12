@@ -227,8 +227,6 @@ static lua_State *g_saved_L = nullptr;
 
 // Bulk dump: use luaL_loadstring to run a Lua script that dumps ALL package.loaded
 static void do_bulk_dump(lua_State *L) {
-    if (g_bulk_dump_done) return;
-    g_bulk_dump_done = true;
 
     if (!p_lua_pcall || !p_lua_getfield || !p_lua_pushvalue ||
         !p_lua_settop || !p_lua_gettop || !p_lua_tolstring) {
