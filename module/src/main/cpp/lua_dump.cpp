@@ -35,6 +35,7 @@ static int (*p_lua_type)(lua_State *L, int index) = nullptr;
 static void (*p_lua_getfield)(lua_State *L, int index, const char *k) = nullptr;
 static void (*p_lua_pushvalue)(lua_State *L, int index) = nullptr;
 static const char *(*p_lua_tolstring)(lua_State *L, int index, size_t *len) = nullptr;
+static int (*p_lua_pcall)(lua_State *L, int nargs, int nresults, int errfunc) = nullptr;
 
 #define LUA_GLOBALSINDEX (-10002)
 static void lua_getglobal(lua_State *L, const char *name) {
