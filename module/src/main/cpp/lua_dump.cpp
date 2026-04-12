@@ -288,7 +288,9 @@ static void do_bulk_dump(lua_State *L) {
     );
     fclose(sf);
 
-    // Read script back into memory and use luaL_loadbuffer (lua_loadfile only reads APK assets)
+    // Read script back, XOR-encrypt it so luaL_loadbuffer's decrypt produces correct source
+    // luaL_loadbuffer triggers xor_v1: key = buf[0] ^ 0x78, XOR from byte 1 in 16-byte blocks
+    // We need to PRE-ENCRYPT the script so that after xor_v1 decrypt it becomes valid Lua source
     sf = fopen(script_path, "rb");
     if (!sf) {
         LOGE("lua_dump: cannot re-read script %s", script_path);
@@ -302,7 +304,19 @@ static void do_bulk_dump(lua_State *L) {
     script_buf[script_len] = 0;
     fclose(sf);
 
-    LOGI("lua_dump: executing bulk dump script (%ld bytes)...", script_len);
+    // Pre-encrypt: apply xor_v1 so that the decrypt pass recovers the original
+    // xor_v1 key = buf[0] ^ 0x78. XOR is self-inverse, so encrypting = decrypting.
+    if (script_len >= 18) {
+        uint8_t key = (uint8_t)script_buf[0] ^ 0x78;
+        int end = script_len - 16;
+        for (int p = 1; p < end; p += 16) {
+            for (int j = 0; j < 16 && p + j < script_len; j++) {
+                script_buf[p + j] ^= key;
+            }
+        }
+    }
+
+    LOGI("lua_dump: executing pre-encrypted bulk dump script (%ld bytes)...", script_len);
     int load_result = orig_luaL_loadbuffer(L, script_buf, script_len, "=dump_script");
     free(script_buf);
     if (load_result != 0) {
