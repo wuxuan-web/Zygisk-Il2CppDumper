@@ -250,12 +250,12 @@ static void do_bulk_dump(lua_State *L) {
         return;
     }
     fprintf(sf, "local dir = '%s/'\n", dir_path);
-    fprintf(sf,
+    fputs(
         "local count = 0\n"
         "local function try_dump(name, fn)\n"
         "  local ok, bc = pcall(string.dump, fn)\n"
         "  if ok and bc then\n"
-        "    local safe = name:gsub('[^%%w_.]', '_')\n"
+        "    local safe = name:gsub('[^%w_.]', '_')\n"
         "    local f = io.open(dir .. safe .. '.luac', 'wb')\n"
         "    if f then f:write(bc); f:close(); count = count + 1 end\n"
         "  end\n"
@@ -285,7 +285,7 @@ static void do_bulk_dump(lua_State *L) {
         "local mf = io.open(dir .. '_manifest.txt', 'w')\n"
         "if mf then mf:write(tostring(count) .. '\\n'); mf:close() end\n"
         "return count\n"
-    );
+    , sf);
     fclose(sf);
 
     // Read script back, XOR-encrypt it so luaL_loadbuffer's decrypt produces correct source
@@ -304,19 +304,7 @@ static void do_bulk_dump(lua_State *L) {
     script_buf[script_len] = 0;
     fclose(sf);
 
-    // Pre-encrypt: apply xor_v1 so that the decrypt pass recovers the original
-    // xor_v1 key = buf[0] ^ 0x78. XOR is self-inverse, so encrypting = decrypting.
-    if (script_len >= 18) {
-        uint8_t key = (uint8_t)script_buf[0] ^ 0x78;
-        int end = script_len - 16;
-        for (int p = 1; p < end; p += 16) {
-            for (int j = 0; j < 16 && p + j < script_len; j++) {
-                script_buf[p + j] ^= key;
-            }
-        }
-    }
-
-    LOGI("lua_dump: executing pre-encrypted bulk dump script (%ld bytes)...", script_len);
+    LOGI("lua_dump: executing bulk dump script (%ld bytes)...", script_len);
     int load_result = orig_luaL_loadbuffer(L, script_buf, script_len, "=dump_script");
     free(script_buf);
     if (load_result != 0) {
