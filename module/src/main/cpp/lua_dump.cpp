@@ -258,14 +258,15 @@ static void do_bulk_dump(lua_State *L) {
     mkdir(dir_path, 0777);
 
     LOGI("lua_dump: starting C API bulk dump...");
-
-    // Get string.dump function
-    // lua_getglobal(L, "string") → lua_getfield(L, -1, "dump")
+    LOGI("lua_dump: step 1 - gettop");
     int base_top = p_lua_gettop(L);
+    LOGI("lua_dump: step 1 done, top=%d", base_top);
+    LOGI("lua_dump: step 2 - getglobal string");
     lua_getglobal(L, "string");        // [string_table]
+    LOGI("lua_dump: step 3 - getfield dump");
     p_lua_getfield(L, -1, "dump");     // [string_table, string.dump]
-    int sd_idx = p_lua_gettop(L);      // index of string.dump
-
+    int sd_idx = p_lua_gettop(L);
+    LOGI("lua_dump: step 4 - check type, sd_idx=%d", sd_idx);
     int has_sd = (p_lua_type(L, sd_idx) == LUA_TFUNCTION);
     LOGI("lua_dump: string.dump is function: %d", has_sd);
 
