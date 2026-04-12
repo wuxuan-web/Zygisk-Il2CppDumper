@@ -359,9 +359,11 @@ static int hooked_luaL_loadbuffer(lua_State *L, const char *buff, size_t sz, con
         LOGI("Lua buffer [%d]: %s (%zu bytes)", g_dumpCount, name ? name : "?", sz);
     }
 
-    // After enough calls (game fully loaded), trigger bulk dump once
-    if (g_dumpCount == 500 && !g_bulk_dump_done) {
-        LOGI("lua_dump: 500 loadbuffer calls, triggering bulk dump...");
+    // After enough calls, trigger bulk dump once
+    // luaL_loadbuffer gets ~20 calls during startup, trigger at 30 to be safe
+    if (g_dumpCount == 30 && !g_bulk_dump_done) {
+        LOGI("lua_dump: 30 loadbuffer calls, waiting 10s for full load then dumping...");
+        sleep(10);  // wait for all lua_loadfile calls to finish
         do_bulk_dump(L);
     }
 
