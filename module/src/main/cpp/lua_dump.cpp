@@ -249,12 +249,47 @@ static void do_bulk_dump(lua_State *L) {
         LOGE("lua_dump: cannot create script file %s", script_path);
         return;
     }
-    // Ultra-simple test: just write "hello" to a file. No function/if/for keywords.
-    fprintf(sf, "local f = io.open('%s/test_ok.txt', 'w')\n", dir_path);
+    // Dump script: avoid 'function' keyword (Lilith's parser rejects it)
+    // Use table-based iteration with no function definitions
+    fprintf(sf, "local dir = '%s/'\n", dir_path);
     fputs(
-        "f:write('DUMP_WORKS')\n"
-        "f:close()\n"
-        "return 1\n"
+        "local sd = string.dump\n"
+        "local count = 0\n"
+        "local ok, bc, safe, fh\n"
+        "for modname, mod in pairs(package.loaded) do\n"
+        "  ok = type(mod)\n"
+        "  if ok == 'table' then\n"
+        "    for fname, fn in pairs(mod) do\n"
+        "      if type(fn) == 'function' then\n"
+        "        ok, bc = pcall(sd, fn)\n"
+        "        if ok and bc then\n"
+        "          safe = tostring(modname) .. '.' .. tostring(fname)\n"
+        "          safe = safe:gsub('[^%w_.]', '_')\n"
+        "          fh = io.open(dir .. safe .. '.luac', 'wb')\n"
+        "          if fh then fh:write(bc); fh:close(); count = count + 1 end\n"
+        "        end\n"
+        "      end\n"
+        "    end\n"
+        "  end\n"
+        "end\n"
+        "for name, val in pairs(_G) do\n"
+        "  if type(val) == 'table' and name ~= '_G' and name ~= 'package' then\n"
+        "    for k, v in pairs(val) do\n"
+        "      if type(v) == 'function' then\n"
+        "        ok, bc = pcall(sd, v)\n"
+        "        if ok and bc then\n"
+        "          safe = tostring(name) .. '.' .. tostring(k)\n"
+        "          safe = safe:gsub('[^%w_.]', '_')\n"
+        "          fh = io.open(dir .. safe .. '.luac', 'wb')\n"
+        "          if fh then fh:write(bc); fh:close(); count = count + 1 end\n"
+        "        end\n"
+        "      end\n"
+        "    end\n"
+        "  end\n"
+        "end\n"
+        "fh = io.open(dir .. '_manifest.txt', 'w')\n"
+        "if fh then fh:write(tostring(count) .. '\\n'); fh:close() end\n"
+        "return count\n"
     , sf);
     fclose(sf);
 
