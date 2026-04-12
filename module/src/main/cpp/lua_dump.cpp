@@ -249,42 +249,12 @@ static void do_bulk_dump(lua_State *L) {
         LOGE("lua_dump: cannot create script file %s", script_path);
         return;
     }
-    fprintf(sf, "local dir = '%s/'\n", dir_path);
+    // Ultra-simple test: just write "hello" to a file. No function/if/for keywords.
+    fprintf(sf, "local f = io.open('%s/test_ok.txt', 'w')\n", dir_path);
     fputs(
-        "local count = 0\n"
-        "local function try_dump(name, fn)\n"
-        "  local ok, bc = pcall(string.dump, fn)\n"
-        "  if ok and bc then\n"
-        "    local safe = name:gsub('[^%w_.]', '_')\n"
-        "    local f = io.open(dir .. safe .. '.luac', 'wb')\n"
-        "    if f then f:write(bc); f:close(); count = count + 1 end\n"
-        "  end\n"
-        "end\n"
-        "for modname, mod in pairs(package.loaded) do\n"
-        "  if type(mod) == 'table' then\n"
-        "    for fname, fn in pairs(mod) do\n"
-        "      if type(fn) == 'function' then\n"
-        "        try_dump(tostring(modname) .. '.' .. tostring(fname), fn)\n"
-        "      end\n"
-        "    end\n"
-        "  elseif type(mod) == 'function' then\n"
-        "    try_dump('mod_' .. tostring(modname), mod)\n"
-        "  end\n"
-        "end\n"
-        "for name, val in pairs(_G) do\n"
-        "  if type(val) == 'function' then\n"
-        "    try_dump('_G.' .. tostring(name), val)\n"
-        "  elseif type(val) == 'table' and name ~= '_G' and name ~= 'package' then\n"
-        "    for k, v in pairs(val) do\n"
-        "      if type(v) == 'function' then\n"
-        "        try_dump(tostring(name) .. '.' .. tostring(k), v)\n"
-        "      end\n"
-        "    end\n"
-        "  end\n"
-        "end\n"
-        "local mf = io.open(dir .. '_manifest.txt', 'w')\n"
-        "if mf then mf:write(tostring(count) .. '\\n'); mf:close() end\n"
-        "return count\n"
+        "f:write('DUMP_WORKS')\n"
+        "f:close()\n"
+        "return 1\n"
     , sf);
     fclose(sf);
 
