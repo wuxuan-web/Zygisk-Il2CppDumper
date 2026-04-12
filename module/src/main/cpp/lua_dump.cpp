@@ -288,8 +288,23 @@ static void do_bulk_dump(lua_State *L) {
     );
     fclose(sf);
 
-    LOGI("lua_dump: executing bulk dump script from %s...", script_path);
-    int load_result = orig_lua_loadfile(L, script_path);
+    // Read script back into memory and use luaL_loadbuffer (lua_loadfile only reads APK assets)
+    sf = fopen(script_path, "rb");
+    if (!sf) {
+        LOGE("lua_dump: cannot re-read script %s", script_path);
+        return;
+    }
+    fseek(sf, 0, SEEK_END);
+    long script_len = ftell(sf);
+    fseek(sf, 0, SEEK_SET);
+    char *script_buf = (char *)malloc(script_len + 1);
+    fread(script_buf, 1, script_len, sf);
+    script_buf[script_len] = 0;
+    fclose(sf);
+
+    LOGI("lua_dump: executing bulk dump script (%ld bytes)...", script_len);
+    int load_result = orig_luaL_loadbuffer(L, script_buf, script_len, "=dump_script");
+    free(script_buf);
     if (load_result != 0) {
         const char *err = p_lua_tolstring(L, -1, NULL);
         LOGE("lua_dump: load script failed: %s", err ? err : "?");
