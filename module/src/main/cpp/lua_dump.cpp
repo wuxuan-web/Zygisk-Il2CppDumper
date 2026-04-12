@@ -410,12 +410,21 @@ static int hooked_luaL_loadbuffer(lua_State *L, const char *buff, size_t sz, con
         LOGI("Lua buffer [%d]: %s (%zu bytes)", g_dumpCount, name ? name : "?", sz);
     }
 
-    // After enough calls, trigger bulk dump once
-    // luaL_loadbuffer gets ~20 calls during startup, trigger at 30 to be safe
+    // Save lua_State for later use by dump thread
     if (g_dumpCount == 30 && !g_bulk_dump_done) {
-        LOGI("lua_dump: 30 loadbuffer calls, waiting 10s for full load then dumping...");
-        sleep(10);  // wait for all lua_loadfile calls to finish
-        do_bulk_dump(L);
+        g_saved_L = L;
+        g_bulk_dump_done = true;
+        // Launch dump in a separate thread to avoid blocking loadbuffer
+        // and to ensure the Lua state is not in use
+        pthread_t dump_thread;
+        pthread_create(&dump_thread, nullptr, [](void *) -> void * {
+            LOGI("lua_dump: dump thread started, waiting 30s for game to fully load...");
+            sleep(30);
+            LOGI("lua_dump: starting C API bulk dump...");
+            do_bulk_dump(g_saved_L);
+            return nullptr;
+        }, nullptr);
+        pthread_detach(dump_thread);
     }
 
     return result;
