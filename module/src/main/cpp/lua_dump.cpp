@@ -249,24 +249,19 @@ static void do_bulk_dump(lua_State *L) {
         LOGE("lua_dump: cannot create script file %s", script_path);
         return;
     }
-    // Lilith's Lua parser rejects: 'function', '..' (concat operator)
-    // Use table.concat and string.format instead of ..
-    // Use no function definitions
+    // Lilith's Lua parser rejects: 'function', '..', 'if'
+    // Use only: local, for, pcall, table ops, io, string.format, and/or short-circuit
     fprintf(sf, "local dir = '%s/'\n", dir_path);
     fprintf(sf, "local tc = table.concat\n");
-    fprintf(sf, "local sf = string.format\n");
     fprintf(sf, "local log = io.open(tc({dir, '_log.txt'}), 'w')\n");
     fprintf(sf, "local sd = string['dump']\n");
-    fprintf(sf, "log:write(sf('sd_type=%%s\\n', type(sd)))\n");
+    fprintf(sf, "log:write(tc({'sd_type=', type(sd), '\\n'}))\n");
     fprintf(sf, "local ok, bc = pcall(sd, print)\n");
-    fprintf(sf, "log:write(sf('ok=%%s bc_type=%%s\\n', tostring(ok), type(bc)))\n");
-    fprintf(sf, "if ok and type(bc) == 'string' then\n");
-    fprintf(sf, "  log:write(sf('bc_len=%%d\\n', #bc))\n");
-    fprintf(sf, "  local fh = io.open(tc({dir, 'print.luac'}), 'wb')\n");
-    fprintf(sf, "  if fh then fh:write(bc); fh:close() end\n");
-    fprintf(sf, "else\n");
-    fprintf(sf, "  log:write(sf('err=%%s\\n', tostring(bc)))\n");
-    fprintf(sf, "end\n");
+    fprintf(sf, "log:write(tc({'ok=', tostring(ok), ' bc_type=', type(bc), '\\n'}))\n");
+    fprintf(sf, "ok = ok and type(bc) == 'string'\n");
+    fprintf(sf, "local fh = ok and io.open(tc({dir, 'print.luac'}), 'wb')\n");
+    fprintf(sf, "local dummy = fh and fh:write(bc)\n");
+    fprintf(sf, "dummy = fh and fh:close()\n");
     fprintf(sf, "log:close()\n");
     fprintf(sf, "return 1\n");
     fclose(sf);
