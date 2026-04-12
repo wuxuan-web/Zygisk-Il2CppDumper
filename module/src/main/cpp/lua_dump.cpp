@@ -249,46 +249,23 @@ static void do_bulk_dump(lua_State *L) {
         LOGE("lua_dump: cannot create script file %s", script_path);
         return;
     }
-    // Diagnostic dump: test string.dump on ONE function, log results
+    // Minimal diagnostic: test if string.dump exists and works on print
     fprintf(sf, "local dir = '%s/'\n", dir_path);
-    fputs(
-        "local log = io.open(dir .. '_log.txt', 'w')\n"
-        "local sd = string.dump\n"
-        "log:write('sd type: ' .. type(sd) .. '\\n')\n"
-        "local total = 0\n"
-        "local ok_count = 0\n"
-        "local fail_count = 0\n"
-        "local first_err = ''\n"
-        "for modname, mod in pairs(package.loaded) do\n"
-        "  if type(mod) == 'table' then\n"
-        "    for fname, fn in pairs(mod) do\n"
-        "      if type(fn) == 'function' then\n"
-        "        total = total + 1\n"
-        "        local ok, bc = pcall(sd, fn)\n"
-        "        if ok and bc then\n"
-        "          ok_count = ok_count + 1\n"
-        "          if ok_count <= 3 then\n"
-        "            local safe = tostring(modname) .. '.' .. tostring(fname)\n"
-        "            safe = safe:gsub('[^%w_.]', '_')\n"
-        "            local fh = io.open(dir .. safe .. '.luac', 'wb')\n"
-        "            if fh then fh:write(bc); fh:close() end\n"
-        "            log:write('OK: ' .. safe .. ' (' .. #bc .. ' bytes)\\n')\n"
-        "          end\n"
-        "        else\n"
-        "          fail_count = fail_count + 1\n"
-        "          if fail_count <= 3 then\n"
-        "            first_err = tostring(bc)\n"
-        "            log:write('FAIL: ' .. tostring(modname) .. '.' .. tostring(fname) .. ' err=' .. first_err .. '\\n')\n"
-        "          end\n"
-        "        end\n"
-        "      end\n"
-        "    end\n"
-        "  end\n"
-        "end\n"
-        "log:write('total=' .. total .. ' ok=' .. ok_count .. ' fail=' .. fail_count .. '\\n')\n"
-        "log:close()\n"
-        "return ok_count\n"
-    , sf);
+    fprintf(sf, "local log = io.open(dir .. '_log.txt', 'w')\n");
+    fprintf(sf, "local sd = string['dump']\n");
+    fprintf(sf, "log:write('sd_type=' .. type(sd) .. '\\n')\n");
+    fprintf(sf, "local ok, bc = pcall(sd, print)\n");
+    fprintf(sf, "log:write('ok=' .. tostring(ok) .. '\\n')\n");
+    fprintf(sf, "log:write('bc_type=' .. type(bc) .. '\\n')\n");
+    fprintf(sf, "if ok and type(bc) == 'string' then\n");
+    fprintf(sf, "  log:write('bc_len=' .. tostring(#bc) .. '\\n')\n");
+    fprintf(sf, "  local fh = io.open(dir .. 'print.luac', 'wb')\n");
+    fprintf(sf, "  if fh then fh:write(bc); fh:close() end\n");
+    fprintf(sf, "else\n");
+    fprintf(sf, "  log:write('err=' .. tostring(bc) .. '\\n')\n");
+    fprintf(sf, "end\n");
+    fprintf(sf, "log:close()\n");
+    fprintf(sf, "return 1\n");
     fclose(sf);
 
     // Read script back, XOR-encrypt it so luaL_loadbuffer's decrypt produces correct source
