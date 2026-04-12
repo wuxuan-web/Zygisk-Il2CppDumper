@@ -222,78 +222,104 @@ static void lua_level_dump(lua_State *L, const char *filename) {
     // This is actually what we need: the RAW .ls bytes before the VM touches them
 }
 
-// Hooked lua_loadfile: intercepts file loading
-// Strategy: after successful load, use pcall(string.dump, func) to get standard bytecode
+static bool g_bulk_dump_done = false;
+static lua_State *g_saved_L = nullptr;
+
+// Bulk dump: use luaL_loadstring to run a Lua script that dumps ALL package.loaded
+static void do_bulk_dump(lua_State *L) {
+    if (g_bulk_dump_done) return;
+    g_bulk_dump_done = true;
+
+    auto p_luaL_loadstring = (int (*)(lua_State *, const char *))
+        xdl_sym(xdl_open("libEngineDll.so", 0), "luaL_loadstring", nullptr);
+
+    if (!p_luaL_loadstring || !p_lua_pcall) {
+        LOGE("lua_dump: missing luaL_loadstring or pcall for bulk dump");
+        return;
+    }
+
+    // Create output dir
+    char dir_path[768];
+    snprintf(dir_path, sizeof(dir_path), "%s/lua_dump", g_outDir);
+    mkdir(dir_path, 0777);
+
+    // Lua script that iterates package.loaded and dumps each function
+    char lua_script[2048];
+    snprintf(lua_script, sizeof(lua_script),
+        "local dir = '%s/'\n"
+        "local count = 0\n"
+        "local function try_dump(name, func)\n"
+        "  local ok, bc = pcall(string.dump, func)\n"
+        "  if ok and bc then\n"
+        "    local safe = name:gsub('[^%%w_.]', '_')\n"
+        "    local f = io.open(dir .. safe .. '.luac', 'wb')\n"
+        "    if f then f:write(bc); f:close(); count = count + 1 end\n"
+        "  end\n"
+        "end\n"
+        "for modname, mod in pairs(package.loaded) do\n"
+        "  if type(mod) == 'table' then\n"
+        "    for fname, func in pairs(mod) do\n"
+        "      if type(func) == 'function' then\n"
+        "        try_dump(tostring(modname)..'.'..tostring(fname), func)\n"
+        "      end\n"
+        "    end\n"
+        "  elseif type(mod) == 'function' then\n"
+        "    try_dump('mod_'..tostring(modname), mod)\n"
+        "  end\n"
+        "end\n"
+        "for name, val in pairs(_G) do\n"
+        "  if type(val) == 'function' then try_dump('_G.'..tostring(name), val)\n"
+        "  elseif type(val) == 'table' and name ~= '_G' and name ~= 'package' then\n"
+        "    for k, v in pairs(val) do\n"
+        "      if type(v) == 'function' then try_dump(tostring(name)..'.'..tostring(k), v) end\n"
+        "    end\n"
+        "  end\n"
+        "end\n"
+        "local f = io.open(dir .. '_manifest.txt', 'w')\n"
+        "if f then f:write(tostring(count)..'\\n'); f:close() end\n"
+        "return count\n",
+        dir_path);
+
+    LOGI("lua_dump: executing bulk dump script...");
+    int load_result = p_luaL_loadstring(L, lua_script);
+    if (load_result != 0) {
+        const char *err = p_lua_tolstring(L, -1, NULL);
+        LOGE("lua_dump: load script failed: %s", err ? err : "?");
+        p_lua_settop(L, p_lua_gettop(L) - 1);
+        return;
+    }
+
+    int pcall_result = p_lua_pcall(L, 0, 1, 0);
+    if (pcall_result != 0) {
+        const char *err = p_lua_tolstring(L, -1, NULL);
+        LOGE("lua_dump: pcall failed: %s", err ? err : "?");
+    } else {
+        LOGI("lua_dump: bulk dump complete!");
+    }
+    p_lua_settop(L, p_lua_gettop(L) - 1);
+}
+
+// Hooked lua_loadfile: log files, trigger bulk dump after 1100+ files loaded
 static int hooked_lua_loadfile(lua_State *L, const char *filename) {
     int result = orig_lua_loadfile(L, filename);
-
-    if (result == 0 && filename && g_outDir[0]) {
+    if (result == 0 && filename) {
         g_fileCount++;
-
-        // The loaded function is on top of stack.
-        // Try: push string.dump, push copy of function, pcall
-        // string library should be loaded by now
-
-        // lua_getglobal(L, "string")
-        // lua_getfield(L, -1, "dump")
-        // lua_pushvalue(L, -3)  -- copy the loaded function
-        // lua_pcall(L, 1, 1, 0) -- call string.dump(func)
-        // result is the bytecode string on stack
-
-        // We need lua_getglobal, lua_getfield, lua_pushvalue, lua_isstring, lua_tolstring
-
-        if (p_lua_getfield && p_lua_pushvalue &&
-            p_lua_tolstring && p_lua_pcall && p_lua_settop && p_lua_gettop) {
-
-            int top = p_lua_gettop(L);
-
-            // Stack: [... func]
-            lua_getglobal(L, "string");       // [... func, string_table]
-            p_lua_getfield(L, -1, "dump");    // [... func, string_table, string.dump]
-            p_lua_pushvalue(L, top);           // [... func, string_table, string.dump, func_copy]
-
-            int pcall_result = p_lua_pcall(L, 1, 1, 0);  // [... func, string_table, bytecode_or_err]
-
-            if (pcall_result == 0) {
-                size_t bc_len = 0;
-                const char *bc = p_lua_tolstring(L, -1, &bc_len);
-
-                if (bc && bc_len > 4) {
-                    // Save the standard bytecode!
-                    char dir_path[768];
-                    snprintf(dir_path, sizeof(dir_path), "%s/lua_dump", g_outDir);
-                    mkdir(dir_path, 0777);
-
-                    std::string safe = sanitize_name(filename);
-                    char out_path[1024];
-                    snprintf(out_path, sizeof(out_path), "%s/%s.luac", dir_path, safe.c_str());
-
-                    FILE *f = fopen(out_path, "wb");
-                    if (f) {
-                        fwrite(bc, 1, bc_len, f);
-                        fclose(f);
-                    }
-
-                    if (g_fileCount <= 30 || g_fileCount % 200 == 0) {
-                        LOGI("Lua string.dump OK [%d]: %s → %zu bytes", g_fileCount, filename, bc_len);
-                    }
-                }
-            } else {
-                if (g_fileCount <= 10) {
-                    const char *err = p_lua_tolstring(L, -1, NULL);
-                    LOGI("Lua string.dump FAIL [%d]: %s → %s", g_fileCount, filename, err ? err : "?");
-                }
-            }
-
-            // Restore stack: pop string_table and result, keep original func
-            p_lua_settop(L, top);
-        }
+        g_saved_L = L;
 
         if (g_fileCount <= 20 || g_fileCount % 100 == 0) {
             LOGI("Lua file [%d]: %s", g_fileCount, filename);
         }
-    }
 
+        // After 1100+ files loaded, trigger bulk dump (game should be fully loaded)
+        if (g_fileCount == 1100 && !g_bulk_dump_done) {
+            LOGI("lua_dump: 1100 files loaded, triggering bulk dump...");
+            // Pop the loaded function, do bulk dump, then re-load this file
+            p_lua_settop(L, p_lua_gettop(L) - 1);
+            do_bulk_dump(L);
+            // Re-load the current file
+            result = orig_lua_loadfile(L, filename);
+        }
+    }
     return result;
 }
 
@@ -416,6 +442,31 @@ static void *install_inline_hook(void *target_func, void *hook_func) {
 
     LOGI("lua_dump: hooked %p → %p (trampoline %p)", target_func, hook_func, trampoline);
     return trampoline;
+}
+
+// Delayed dump: wait for game to load, then inject Lua code to dump all loaded modules
+static void *delayed_dump_thread(void *arg) {
+    // Wait for game to finish loading Lua scripts
+    LOGI("lua_dump: delayed dump thread started, waiting 60s for game to load...");
+    sleep(60);
+
+    if (!p_lua_getfield || !p_lua_pcall || !p_lua_tolstring || !p_lua_settop || !p_lua_gettop) {
+        LOGE("lua_dump: missing Lua API for delayed dump");
+        return nullptr;
+    }
+
+    // We need a lua_State. Get one from the il2cpp side via the Lua API.
+    // Use luaL_loadbuffer to compile a dump script, then pcall it.
+    auto p_luaL_newstate = (lua_State *(*)())xdl_sym(xdl_open("libEngineDll.so", 0), "luaL_newstate", nullptr);
+    auto p_luaL_openlibs = (void (*)(lua_State *))xdl_sym(xdl_open("libEngineDll.so", 0), "luaL_openlibs", nullptr);
+    auto p_luaL_loadstring = (int (*)(lua_State *, const char *))xdl_sym(xdl_open("libEngineDll.so", 0), "luaL_loadstring", nullptr);
+
+    // We can't create a new state easily. Instead, hook into the NEXT lua_loadfile call
+    // and use THAT lua_State to run our dump script.
+    // Set a flag that the next lua_loadfile hook will pick up.
+    LOGI("lua_dump: delayed dump ready, will dump on next Lua file load");
+
+    return nullptr;
 }
 
 static bool install_hooks() {
