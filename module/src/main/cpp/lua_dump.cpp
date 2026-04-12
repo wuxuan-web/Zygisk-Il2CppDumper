@@ -348,47 +348,24 @@ static int hooked_lua_loadfile(lua_State *L, const char *filename) {
     return result;
 }
 
-// Hooked luaL_loadbuffer: intercepts buffer loading, saves the raw buffer
+// Hooked luaL_loadbuffer: count calls, trigger bulk dump after delay
 static int hooked_luaL_loadbuffer(lua_State *L, const char *buff, size_t sz, const char *name) {
-    // Save the buffer content BEFORE loading (this is the encrypted .ls bytecode)
-    if (buff && sz > 100 && name && g_outDir[0]) {
-        g_dumpCount++;
+    int result = orig_luaL_loadbuffer(L, buff, sz, name);
 
-        char dir_path[768];
-        snprintf(dir_path, sizeof(dir_path), "%s/lua_dump", g_outDir);
-        mkdir(dir_path, 0777);
+    g_dumpCount++;
+    g_saved_L = L;
 
-        std::string safe = sanitize_name(name);
-        char out_path[1024];
-
-        // Save raw buffer (Lilith's custom encrypted format)
-        snprintf(out_path, sizeof(out_path), "%s/%s.ls", dir_path, safe.c_str());
-        FILE *f = fopen(out_path, "wb");
-        if (f) {
-            fwrite(buff, 1, sz, f);
-            fclose(f);
-        }
-
-        // Save XOR 0x63 decrypted copy
-        if (sz > 1 && (uint8_t)buff[0] == 0x1b) {
-            snprintf(out_path, sizeof(out_path), "%s/%s.luac", dir_path, safe.c_str());
-            f = fopen(out_path, "wb");
-            if (f) {
-                fwrite(buff, 1, 1, f); // byte 0 stays
-                for (size_t i = 1; i < sz; i++) {
-                    uint8_t b = (uint8_t)buff[i] ^ 0x63;
-                    fwrite(&b, 1, 1, f);
-                }
-                fclose(f);
-            }
-        }
-
-        if (g_dumpCount <= 20 || g_dumpCount % 200 == 0) {
-            LOGI("Lua buffer [%d]: %s (%zu bytes)", g_dumpCount, name, sz);
-        }
+    if (g_dumpCount <= 20 || g_dumpCount % 500 == 0) {
+        LOGI("Lua buffer [%d]: %s (%zu bytes)", g_dumpCount, name ? name : "?", sz);
     }
 
-    return orig_luaL_loadbuffer(L, buff, sz, name);
+    // After enough calls (game fully loaded), trigger bulk dump once
+    if (g_dumpCount == 500 && !g_bulk_dump_done) {
+        LOGI("lua_dump: 500 loadbuffer calls, triggering bulk dump...");
+        do_bulk_dump(L);
+    }
+
+    return result;
 }
 
 // Install inline hook on a function
@@ -528,15 +505,10 @@ static bool install_hooks() {
 
     bool hooked = false;
 
-    // Hook lua_loadfile (main script file loading path)
-    if (p_lua_loadfile) {
-        auto tramp = install_inline_hook((void *)p_lua_loadfile, (void *)hooked_lua_loadfile);
-        if (tramp) {
-            orig_lua_loadfile = (decltype(orig_lua_loadfile))tramp;
-            LOGI("lua_dump: lua_loadfile hooked");
-            hooked = true;
-        }
-    }
+    // Skip lua_loadfile hook - inline hook causes SIGSEGV due to ADRP relocation issues
+    // The bulk dump will be triggered from luaL_loadbuffer instead
+    orig_lua_loadfile = p_lua_loadfile;  // save for calling later
+    LOGI("lua_dump: lua_loadfile saved (no hook, avoids ADRP crash)");
 
     // Hook luaL_loadbuffer (buffer/string loading path)
     if (p_luaL_loadbuffer_addr) {
